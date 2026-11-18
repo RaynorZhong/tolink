@@ -1,3 +1,6 @@
+mod addressing;
+mod journal;
+mod process;
 mod runtime;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
@@ -11,7 +14,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
-    process::{Command, Stdio},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -184,6 +187,7 @@ fn wire(
     endpoint: &str,
     query: &str,
     body: Option<&[u8]>,
+    curl_path: &Path,
 ) -> Result<WireResponse> {
     let rest = base.strip_prefix("https://").ok_or("API requires HTTPS")?;
     let (authority, prefix) = rest.split_once('/').ok_or("full API base path required")?;
@@ -202,7 +206,7 @@ fn wire(
         body.is_none_or(|raw| raw.len() <= 32768),
         "request body exceeds 32 KiB",
     )?;
-    let mut command = Command::new("/usr/bin/curl");
+    let mut command = Command::new(curl_path);
     command
         .args([
             "--disable",
@@ -212,6 +216,7 @@ fn wire(
             "*",
             "--proto",
             "=https",
+            "--tlsv1.3",
             "--max-redirs",
             "0",
             "--path-as-is",
@@ -272,6 +277,10 @@ fn wire(
     };
     command.arg(format!("{base}{endpoint}{suffix}"));
     let output = runtime::capture(command, body.unwrap_or_default(), 45, false)?;
+    require(
+        output.status.code() != Some(4),
+        "configured curl cannot enforce TLS 1.3; choose a capable installed curl_executable; no automatic fallback",
+    )?;
     let headers = String::from_utf8_lossy(&output.stderr);
     let retry = headers
         .lines()
@@ -291,7 +300,6 @@ fn wire(
         .ok_or("missing HTTP status")?;
     let status: u16 = std::str::from_utf8(&output.stdout[split + 1..])?.parse()?;
     let value = serde_json::from_slice(&output.stdout[..split]).ok();
-    require(!(300..400).contains(&status), "redirect refused")?;
     Ok(WireResponse {
         status,
         retry_after: retry,
@@ -306,9 +314,18 @@ fn request(
     key_path: Option<&Path>,
     endpoint: &str,
     body: Option<&[u8]>,
+    curl_path: &Path,
 ) -> Result<(u16, Value)> {
     let signing_key = key_path.map(key).transpose()?;
-    let response = wire(base, ca, signing_key.as_ref(), endpoint, "", body)?;
+    let response = wire(
+        base,
+        ca,
+        signing_key.as_ref(),
+        endpoint,
+        "",
+        body,
+        curl_path,
+    )?;
     if let Some(seconds) = response.retry_after {
         eprintln!("Retry-After: {seconds}; this command does not retry");
     }
@@ -332,26 +349,50 @@ fn main() -> Result<()> {
         ["vectors", file] => vectors(Path::new(file)),
         ["run", home] => runtime::run(Path::new(home)),
         ["self", home] => runtime::fresh_self(Path::new(home)),
+        ["status", home] => runtime::status(Path::new(home)),
+        ["inspect", home] => runtime::inspect(Path::new(home)),
+        ["recover", home, generation, action, "--confirm", confirm]
+            if matches!(*action, "discard" | "retry") =>
+        {
+            runtime::recover(Path::new(home), generation, action, None, confirm)
+        }
+        [
+            "recover",
+            home,
+            generation,
+            "import",
+            file,
+            "--confirm",
+            confirm,
+        ] => runtime::recover(
+            Path::new(home),
+            generation,
+            "import",
+            Some(Path::new(file)),
+            confirm,
+        ),
         ["speak", home, recipient, topic, request_id] => {
             runtime::speak(Path::new(home), recipient, topic, request_id)
         }
         ["model-check", home] => runtime::model_check(Path::new(home)),
 
-        ["probe", base, ca] => {
-            let (status, _) = request(base, Path::new(ca), None, "self", None)?;
-            require(status == 401, "expected unsigned self to be unauthorized")?;
-            println!(
-                "{}",
-                json!({"https_ca_and_target_verified": true, "unsigned_self_status": status, "authenticated": false, "application_submitted": false})
-            );
-            Ok(())
-        }
+        ["probe", base, ca] => probe(base, ca, "/usr/bin/curl"),
+        ["probe", base, ca, curl] => probe(base, ca, curl),
 
         _ => {
             eprintln!(
-                "tolink run STATE_DIRECTORY\ntolink self STATE_DIRECTORY\ntolink speak STATE_DIRECTORY RECIPIENT TOPIC OWNER_REQUEST_ID\ntolink model-check WORK_DIRECTORY\ntolink vectors FILE\ntolink probe HTTPS_BASE CA\nrun is a foreground worker; model-check generates without publishing. self uses the existing worker's single request lane when locked. speak requires the worker to be normally stopped first. No registration, scheduler or boot-service commands."
+                "tolink run STATE_DIRECTORY\ntolink self STATE_DIRECTORY\ntolink status STATE_DIRECTORY\ntolink inspect STATE_DIRECTORY\ntolink recover STATE_DIRECTORY GENERATION_ID discard|retry --confirm GENERATION_ID\ntolink recover STATE_DIRECTORY GENERATION_ID import RESULT_JSON --confirm GENERATION_ID\ntolink speak STATE_DIRECTORY RECIPIENT TOPIC OWNER_REQUEST_ID\ntolink model-check STATE_DIRECTORY\ntolink vectors FILE\ntolink probe HTTPS_BASE CA [CURL_EXECUTABLE]\nstatus/inspect are offline and read-only. recover requires the writer stopped and exact ID confirmation. run is a foreground worker. model-check shares the finite daily budget and does not publish. self uses the worker's single request lane. speak requires a normal stop first. No registration, scheduler or boot-service commands."
             );
             Err("invalid command".into())
         }
     }
+}
+fn probe(base: &str, ca: &str, curl: &str) -> Result<()> {
+    let (status, _) = request(base, Path::new(ca), None, "self", None, Path::new(curl))?;
+    require(status == 401, "expected unsigned self to be unauthorized")?;
+    println!(
+        "{}",
+        json!({"https_ca_and_target_verified": true, "minimum_tls":"1.3", "curl_executable":curl, "unsigned_self_status": status, "authenticated": false, "application_submitted": false})
+    );
+    Ok(())
 }

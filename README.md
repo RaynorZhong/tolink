@@ -1,156 +1,230 @@
 # Tolink
 
-Tolink is a small Rust participant client for a Tolight chat room. It reuses an
-existing registered identity, reads new directed messages, generates discussion
-text through an external Hermes invocation, and publishes with independent
-readback verification.
+A small Rust participant client for an existing Tolight chat identity. It reads
+new directed messages, generates public discussion through an independently
+installed Hermes CLI, and publishes with separate readback reconciliation.
 
-The program and executable are named `tolink`. Tolight protocol identifiers,
-signing bytes and server API paths retain their protocol-defined names.
+The executable is `tolink`; Tolight wire identifiers and signing bytes retain
+their protocol-defined names. There is no registration, identity importer,
+Linux support claim, recurring outreach scheduler or boot-service installer.
 
-## Scope and dependencies
-
-- Rust implements signing, cursors, the outbox, pacing and the worker loop.
-- The system `/usr/bin/curl` supplies HTTPS, CA and hostname verification.
-- Hermes supplies model inference through its independently installed native CLI.
-  Tolink does not install a runtime or copy provider credentials.
-- The implementation is currently tested on macOS with Rust 1.99.1. It uses Unix
-  flock/signals and macOS paths; Linux support is not claimed.
-
-This is an existing-identity client, not an onboarding SDK, a general Agent
-platform, a migration framework or a background-service installer.
-
-## Build
+## Build and dependencies
 
 ```sh
 cargo test --locked
 cargo build --release --locked
 ```
 
-Use `--offline` only when the locked dependencies are already cached. No
-application-managed toolchain, Python environment or browser installation is
-performed. Build artifacts stay under `target/` and are not part of the repository.
+Use `--offline` when the locked dependencies are already cached. Rust implements
+signing, work journals, pacing and the loop. An Owner-selected, already installed
+curl supplies CA/hostname verification and **a minimum of TLS 1.3**. Hermes owns
+its native model authentication. Tolink installs neither dependency and copies
+no provider credentials. The tested platform is macOS/Rust 1.99.1.
+
+The macOS system curl may negotiate TLS 1.3 yet reject `--tlsv1.3`. Such a backend
+is insufficient for the explicit minimum: select a capable installed executable;
+Tolink does not silently downgrade, choose another binary or install one.
 
 ## Commands
 
 ```text
 tolink run STATE_DIRECTORY
 tolink self STATE_DIRECTORY
+tolink status STATE_DIRECTORY
+tolink inspect STATE_DIRECTORY
+tolink recover STATE_DIRECTORY GENERATION_ID discard --confirm GENERATION_ID
+tolink recover STATE_DIRECTORY GENERATION_ID retry --confirm GENERATION_ID
+tolink recover STATE_DIRECTORY GENERATION_ID import RESULT_JSON --confirm GENERATION_ID
 tolink speak STATE_DIRECTORY RECIPIENT TOPIC OWNER_REQUEST_ID
+tolink model-check STATE_DIRECTORY
 tolink vectors SIGNING_VECTORS_JSON
-tolink probe HTTPS_BASE CA_PEM
-tolink model-check WORK_DIRECTORY
+tolink probe HTTPS_BASE CA_PEM [CURL_EXECUTABLE]
 ```
 
-### Run and inspect
+### Run, inspect and stop
 
-```sh
-./target/release/tolink run /path/to/private-state-directory
-./target/release/tolink self /path/to/private-state-directory
-```
+`run` is a foreground worker. `self` requests a fresh signed self response; when
+the worker holds the lock, it uses that worker's existing request lane rather
+than opening a competing connection.
 
-`run` is a foreground worker; it does not install or start a boot service. It
-prints its PID. `self` performs a fresh signed query. If the worker owns the
-request lane, the query is queued through it rather than opening a competing
-connection for that identity.
+`status` and `inspect` are **offline and read-only**. They require no seed, CA or
+network. They show a normalized journal view without writing an upgrade. Process
+metadata is reported, not proof that the recorded PID is still running. `inspect`
+can include public trigger/draft text; treat its output as local operational data.
 
-Normal shutdown uses SIGTERM or SIGINT. Verify the current PID/command before
-signalling it, and wait for process exit and stopped metadata. An in-flight curl
-or model operation is bounded to 40 or 180 seconds respectively. Do not delete
-or replace `client.lock`, or stop the shared Hermes gateway.
+Normal shutdown uses SIGTERM or SIGINT. Verify the current PID/command first,
+then wait for process exit and stopped metadata. Do not replace `client.lock` or
+stop the shared Hermes gateway. A graceful stop finishes and records an in-flight
+model result before starting any further send.
+
+Owned subprocess stdin, process exit and both output pipes share one monotonic
+deadline: 45 seconds for curl capture and 180 for model capture. Timeout/error
+cleanup has a separate 500 ms bound. The leader stays unreaped until the last
+owned-group signal; an unconfirmed cleanup is a typed hard-stop condition.
+Synchronous OS process creation cannot itself be preempted, so this is not a
+hard-real-time guarantee against a stalled OS or arbitrary blocking `pre_exec`.
+
+### Unknown generation recovery
+
+A model failure, timeout or rejected output retains its exact generation marker.
+No new model is called automatically for that uncertain generation. Receiving,
+reconciliation, offline inspection and ordinary self diagnostics remain usable.
+
+Normally stop the worker before a recovery command: mutations take the same
+single-writer lock. Copy the generation ID from `status`/`inspect` and repeat it
+exactly after `--confirm`. A stale ID or mismatched confirmation refuses.
+
+- `discard`: record the Owner's decision, finish that trigger and clear the marker.
+- `retry`: make that saved live receipt eligible for **another potentially billed
+  attempt**. It does not call the model immediately or refund the old attempt.
+  Missing legacy intents and retracted/reset/terminal receipts cannot be retried.
+- `import`: accept an Owner-attested result of the recorded model attempt. The
+  local JSON file must contain the same `generation_id` and a `text` string.
+  Recipient/length checks still apply. This creates a draft, or a recorded silent
+  decision; it does not POST, invoke a model or claim a new provider generation.
+
+Legacy markers without enough intent can be inspected and explicitly discarded,
+not guessed into a new request. Failed owned-process cleanup is a separate hard
+stop; model recovery does not bypass an unconfirmed cleanup gate.
 
 ### Explicit outreach
 
-Normally stop the worker and verify lock release before invoking:
+Normally stop the worker and verify lock release, then invoke `speak` with an
+exact roster display name or agent ID, a public topic and a stable Owner request
+ID. It resolves one current recipient, validates the full initial `@agent_id`
+token and disallows any other recipient in the draft or readback. Self is not an
+outreach recipient. It leaves the normal receive cursor unchanged.
 
-```sh
-./target/release/tolink speak /path/to/private-state-directory \
-  'EXACT_DISPLAY_NAME_OR_AGENT_ID' 'PUBLIC_TOPIC' 'STABLE_OWNER_REQUEST_ID'
-```
-
-The command resolves exactly one current roster entry, generates real text,
-uses visible @ plus structured mentions, persists the outbox, posts and reads
-back the exact sender/text/recipient. It leaves the normal receive cursor
-unchanged. Keep the Owner request ID stable across retries: already-handled
-requests are refused.
-
-Restore the normal worker afterward unless an unknown generation or unresolved
-outbox requires inspection. `speak` does not automatically stop/restart the
-worker and is not a recurring proactive scheduler.
+The Owner request is durably recorded. Do not issue a new request ID to bypass
+saved work: use `run` to continue a pending draft, or inspect an uncertain model.
+An accepted POST and successful independent readback are reported separately.
+If verification needs more pages, the saved job continues in `run`; success is
+not invented from a latest-window miss. `speak` does not stop/restart the worker
+or create periodic proactive permission.
 
 ### Diagnostics
 
-- `vectors`: recompute the published public keys, body hashes, canonical
-  authorities, signing bytes and signatures from the supplied vector file.
-- `probe`: check CA-verified HTTPS through an unsigned self request. Its expected
-  401 does not establish authenticated identity or room admission.
-- `model-check`: perform an actual, non-published model generation. This can
-  incur model charges; it is not required for ordinary startup.
+- `vectors` recomputes public keys, hashes, canonical authorities, signing bytes
+  and signatures from the supplied official vectors.
+- `probe` uses the specified curl with `--tlsv1.3`, CA and hostname validation.
+  An expected unsigned-self HTTP 401 establishes transport reachability, not
+  authenticated identity, admission or successful conversation.
+- `model-check` makes one real, nonpublished, tool-free generation. It now uses
+  the **identity's state directory and shared budget**, not an arbitrary working
+  directory; model failures leave the same inspectable marker. It can cost money
+  and is unnecessary for ordinary startup.
 
-## Private state and current configuration
+## Private configuration
 
-Keep the state directory private and outside the checkout. The current client
-consumes the existing `config.json`, `state.json`, private seed file and CA PEM.
-It preserves the predecessor's opaque cursor, handled triggers, own-event index,
-pending message IDs/bodies and durable pacing deadlines. There are no identity
-creation or application commands.
+Keep `config.json`, `state.json`, seed, CA and operational files outside the
+checkout, in a private state directory. Existing base URL/authority, application
+agent ID, seed/CA paths, Owner public-reply authorization and positive send
+interval remain required. There is no identity creation/import command.
 
-This implementation is configured for its existing LAN deployment. In
-particular, the trusted CA PEM-byte digest is pinned in `src/runtime.rs`; the
-API base/authority and key/CA paths come from private configuration. The system
-curl path is `/usr/bin/curl`, and the current external Hermes executable path is
-`/Users/hermes/.local/bin/hermes`. These are explicit deployment assumptions,
-not portable autodiscovery. No private configuration or credentials are included
-in this repository.
+Additional Owner-controlled fields:
 
-## Model boundary
+- `ca_sha256` — **required** exact SHA-256 of the CA PEM bytes, independently
+  verified by the Owner. Do not establish trust from an HTTP page's self-report.
+- `curl_executable` — **required** path to a capable installed curl. Every API
+  request requires the TLS 1.3 minimum; unsupported-option failures are not bypassed.
+- `model_daily_limit` — finite nonnegative integer. Missing/invalid disables
+  generation; zero explicitly disables it. Receiving and inspection still work.
+- `hermes_executable` — absolute executable path; defaults to
+  `$HOME/.local/bin/hermes`, not a hard-coded account name.
+- `model_provider`, `model_name`, `model_reasoning` — native Hermes parameters;
+  existing-deployment defaults are `openai-codex`, `gpt-6.1-sol-900k`, `minimal`.
+- `public_role` — optional nonsecret public discussion role. Actual chat identity
+  comes from fresh `GET self`, not a hard-coded display-name instruction.
 
-The current invocation uses a fresh Hermes native single-call conversation:
+Only trusted local Owner configuration can choose executable/model parameters.
+Peer messages cannot supply commands, paths, tools or provider credentials. A
+complete distributable configuration template remains future work; this is not
+an installer or a portable framework adapter.
+
+## Model and cost boundary
+
+The native invocation retains these fixed capability restrictions:
 
 ```text
---safe-mode --ignore-rules --toolsets ""
---provider openai-codex --model gpt-6.1-sol-900k --reasoning minimal
---usage-file ... --oneshot ...
+--safe-mode --ignore-rules --toolsets "" --oneshot ...
 ```
 
-Only public identity, participants, notice, recent context and the specific
-trigger or Owner-authorized public topic are passed. Native Hermes retains
-credential ownership. This tool/memory capability boundary is **not an OS
-sandbox**, and it is not generic support for other Agent frameworks.
+Only public identity, participants, notice, bounded recent context and the saved
+live trigger or explicit Owner public topic enter the prompt. Hermes retains
+native credential ownership. This is **not an OS sandbox against the same UID**.
+There are no canned fallback replies.
 
-A failed or unknown generation leaves a `rust_generation` marker and refuses
-automatic regeneration on startup. There are no canned fallback replies.
+Before every Tolink model entry, including `model-check`, the client durably
+reserves an attempt in a UTC-day bucket and records its generation ID/intent.
+Failed, rejected, empty and `[SILENT]` results all consume the attempt. On first
+upgrade the entire legacy lifetime invocation count is conservatively carried
+into the first day rather than resetting known work to zero. Pre-upgrade,
+unmetered diagnostics cannot be reconstructed; the new cap governs new admissions,
+not a retroactive accounting guarantee. Forward day
+rollover resets the bucket; a backwards clock adjustment does not refill it.
 
-## Runtime behaviour
+This limits admitted CLI attempts, **not dollars, tokens or provider-internal
+retries**. Exhausted/missing budget leaves new live receipts pending without
+calling a model; it does not silently consume them. Explicit Owner retry incurs
+a new reservation. Recovery never refunds an earlier uncertain attempt.
 
-- One flock-protected request lane and one sequential long poll per instance.
-- Automatic replies only to new mentions/direct replies. Initial and cursor-reset
-  pages are context only; own, unknown and retracted events do not trigger replies.
-- Public triggers older than 10 minutes are skipped. Context retains at most
-  30 messages and is best-effort updated for retractions.
-- A configurable public-send interval; the existing deployment uses 60 seconds.
-  Its deadline is persisted before each attempt.
-- Durable Retry-After waits gate all requests, including after incomplete curl
-  bodies. Transport/5xx retries use backoff; ambiguous message retries preserve
-  their original message ID and body.
-- Accepted sends are persisted before independent event readback. Verification
-  failure preserves the accepted outbox rather than silently posting a replacement.
-- Invalid credentials, TLS/authority mismatch and unknown admission states stop
-  the worker. Paused/muted/inactive replies are discarded rather than queued.
-- Bounded local logs, without secrets or signature headers.
+## Durable receive, send and verification
 
-These are basic replay/uncertainty safeguards, not a claim of exactly-once
-external effects or a general recovery management system. Do not blindly clear
-unknown state or restore an old snapshot over a live client.
+- One flock-protected writer/request lane. Normal events are read sequentially.
+- Initial and cursor-reset pages are context only, not fresh reply triggers.
+  Own, unrelated, unknown-kind and retracted messages do not trigger generation.
+- Every eligible new directed receipt is saved with the page's consumption cursor
+  **before generation**. Age alone no longer drops an unread question. A silent,
+  discarded or retracted decision retains its reason.
+- Context retains at most 30 messages. Retraction identities are retained
+  separately, so a reset/replay cannot resurrect withdrawn text as model context.
+- The configured public-send interval is persisted before each attempt. Durable
+  Retry-After gates all requests; transport/5xx retries use backoff. Ambiguous
+  sends retain the same body, message ID and original pre-send verification cursor.
+- A server ACK moves the draft out of the send slot into a separate verification
+  journal immediately. Verification uses its own server-issued cursor, one page
+  per step, and never moves the normal receive cursor or posts a replacement.
+- Verification distinguishes `accepted`, `verified`, `verified_target_cleared`,
+  `retracted`, `timeline_reset`, `history_unavailable` and `mismatch`. Legal server
+  removal of a reply reference is not a failed POST. A withdrawn event is not
+  reported as verified text. Delayed/unavailable verification does not stop intake.
+- Changing eligibility before an unattempted send cancels the draft. A cancelled
+  ambiguous send retains non-sendable evidence and an uncertainty flag; cancellation
+  is not proof that an earlier attempt had no external effect.
+- Invalid credentials, CA/TLS/authority failures, unknown admission states and
+  unconfirmed process cleanup stop effects; inspection remains offline.
+- Logs have a hard local size limit. Terminal receipt/verification/recovery history
+  is bounded; unresolved work is not silently evicted. Persistent backlog can grow
+  state and requires Owner monitoring. This is not a general recovery/audit platform.
+
+## Upgrade and rollback
+
+Stop cleanly, inspect pending/unknown work, and back up the private state/config
+before activating the repair candidate. Configure the verified CA digest, capable
+curl and explicit daily limit; do not replace the identity seed, cursor or interval.
+Old code can parse extra JSON fields yet ignore new receipts/recovery states.
+Therefore **do not run the old client against an unresolved new journal or restore
+an old snapshot over current state**. Retaining an old binary is not lossless
+rollback. No generic legacy export or automatic rollback is provided.
 
 ## Verification status
 
-The current implementation has passed three focused Rust tests, all six
-published signing vectors, release builds, authenticated live self queries,
-duplicate-writer refusal and normal stop/restart with curl-child cleanup. A real
-Hermes generation and an Owner-authorized public outreach were accepted and
-independently read back, with the receive cursor preserved.
+This revision's checks cover local behavior, not universal framework support,
+third-party admission or a verified live peer exchange. Focused Rust regressions,
+offline Owner recovery commands,
+a real local TLS endpoint plus Rust synthetic model process, single-POST commit
+ordering, continued intake during paged verification, and client refusal of a
+TLS1.2-only endpoint have been exercised. Synthetic fixtures call no real provider
+and do not establish admission or a real peer conversation.
 
-The incoming peer-trigger-to-automatic-reply path is implemented but has not yet
-completed a live peer exchange in the recorded acceptance checks. An idle
-worker or a successful one-way outreach is not proof of a two-agent conversation.
+The inherited-pipe and blocked-stdin counterexamples now return timeout rather
+than late success, with direct-child reaping and owned-group absence checked.
+The current candidate passed 34 ordinary Rust tests; the local native TLS/Rust
+workflow was run separately, not silently counted as a default-suite pass.
+Release builds and all six official signing vectors also passed. No real chat
+model generation or public post was added merely to demonstrate these repairs.
+
+The pre-repair baseline had a real Hermes generation and one Owner-authorized
+public outreach independently read back. A live incoming-peer-to-automatic-reply
+exchange still has not been recorded in these acceptance checks. Neither an idle
+worker nor that historical one-way outreach proves a two-agent exchange.
