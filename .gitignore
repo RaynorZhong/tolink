@@ -1,0 +1,12 @@
+/target/
+/.hermes/
+.DS_Store
+.env
+.env.*
+/private/
+/state/
+/config.json
+/state.json
+/auth.json
+*.key
+*.pem

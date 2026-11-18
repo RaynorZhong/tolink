@@ -1,0 +1,357 @@
+mod runtime;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signer, SigningKey};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    env,
+    error::Error,
+    fs,
+    io::{Read, Write},
+    net::{Ipv4Addr, Ipv6Addr},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::Path,
+    process::{Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
+fn require(ok: bool, message: &str) -> Result<()> {
+    if ok { Ok(()) } else { Err(message.into()) }
+}
+fn sha(raw: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(raw))
+}
+fn host(authority: &str, scheme: &str) -> Result<String> {
+    require(
+        !authority.is_empty()
+            && authority.is_ascii()
+            && !authority
+                .chars()
+                .any(|c| c.is_whitespace() || "@/?#%".contains(c)),
+        "invalid authority",
+    )?;
+    let (name, port) = if authority.starts_with('[') {
+        let end = authority.find(']').ok_or("invalid IPv6 authority")?;
+        let ip: Ipv6Addr = authority[1..end].parse()?;
+        let expanded = ip.segments().map(|s| format!("{s:04x}")).join(":");
+        let tail = &authority[end + 1..];
+        (
+            format!("[{expanded}]"),
+            if tail.is_empty() {
+                None
+            } else {
+                Some(tail.strip_prefix(':').ok_or("invalid port")?)
+            },
+        )
+    } else {
+        let (name, port) = match authority.split_once(':') {
+            Some((n, p)) => (n, Some(p)),
+            None => (authority, None),
+        };
+        require(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b".-".contains(&c)),
+            "invalid hostname",
+        )?;
+        let name = if name.bytes().all(|c| c.is_ascii_digit() || c == b'.') {
+            name.parse::<Ipv4Addr>()?.to_string()
+        } else {
+            name.to_ascii_lowercase()
+        };
+        (name, port)
+    };
+    let default = match scheme {
+        "https" => 443,
+        "http" => 80,
+        _ => return Err("unsupported scheme".into()),
+    };
+    match port {
+        None => Ok(name),
+        Some(p) => {
+            require(
+                !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()),
+                "invalid port",
+            )?;
+            let n: u16 = p.parse()?;
+            require(n != 0, "invalid port")?;
+            Ok(if n == default {
+                name
+            } else {
+                format!("{name}:{n}")
+            })
+        }
+    }
+}
+fn signing(
+    method: &str,
+    host: &str,
+    path: &str,
+    query: &str,
+    timestamp: &str,
+    body: &[u8],
+) -> String {
+    format!(
+        "tolight-participant-v1\n{method}\n{host}\n{path}\n{query}\n{timestamp}\n{}",
+        sha(body)
+    )
+}
+fn key_from_bytes(raw: &[u8]) -> Result<SigningKey> {
+    let seed = URL_SAFE_NO_PAD.decode(std::str::from_utf8(raw)?.trim())?;
+    let seed: [u8; 32] = seed.try_into().map_err(|_| "seed must contain 32 bytes")?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+fn key(path: &Path) -> Result<SigningKey> {
+    let meta = fs::symlink_metadata(path)?;
+    require(
+        meta.is_file() && !meta.file_type().is_symlink() && meta.permissions().mode() & 0o077 == 0,
+        "key must be a private regular file",
+    )?;
+    key_from_bytes(&fs::read(path)?)
+}
+fn vectors(path: &Path) -> Result<()> {
+    let data: Value = serde_json::from_slice(&fs::read(path)?)?;
+    require(
+        data["scheme"] == "tolight-participant-v1",
+        "wrong signing scheme",
+    )?;
+    let rows = data["vectors"].as_array().ok_or("missing vectors")?;
+    require(!rows.is_empty(), "empty vector set")?;
+    for v in rows {
+        let field = |name: &str| -> Result<&str> {
+            v[name]
+                .as_str()
+                .ok_or_else(|| format!("missing {name}").into())
+        };
+        let k = key_from_bytes(field("seed")?.as_bytes())?;
+        let body = URL_SAFE_NO_PAD.decode(field("body_base64url")?)?;
+        let (scheme, rest) = field("url")?
+            .split_once("://")
+            .ok_or("invalid vector URL")?;
+        let authority = rest.split('/').next().ok_or("missing authority")?;
+        let canonical = host(authority, scheme)?;
+        require(
+            canonical == field("host")? && authority == field("authority")?,
+            "vector authority mismatch",
+        )?;
+        if let Some(equivalents) = v["equivalent_authorities"].as_array() {
+            for a in equivalents {
+                require(
+                    host(a.as_str().ok_or("bad authority")?, scheme)? == canonical,
+                    "equivalent authority mismatch",
+                )?;
+            }
+        }
+        require(
+            URL_SAFE_NO_PAD.encode(k.verifying_key().as_bytes()) == field("public_key")?,
+            "vector public key mismatch",
+        )?;
+        require(sha(&body) == field("body_sha256")?, "vector body mismatch")?;
+        let message = signing(
+            field("method")?,
+            &canonical,
+            field("path")?,
+            field("query")?,
+            field("timestamp")?,
+            &body,
+        );
+        require(
+            message == field("string_to_sign")?,
+            "vector signing bytes mismatch",
+        )?;
+        require(
+            URL_SAFE_NO_PAD.encode(k.sign(message.as_bytes()).to_bytes()) == field("signature")?,
+            "vector signature mismatch",
+        )?;
+        println!("PASS {}", field("name")?);
+    }
+    println!("{} signing vectors passed", rows.len());
+    Ok(())
+}
+struct WireResponse {
+    status: u16,
+    retry_after: Option<u64>,
+    complete: bool,
+    value: Option<Value>,
+    tls_fatal: bool,
+}
+fn wire(
+    base: &str,
+    ca: &Path,
+    signing_key: Option<&SigningKey>,
+    endpoint: &str,
+    query: &str,
+    body: Option<&[u8]>,
+) -> Result<WireResponse> {
+    let rest = base.strip_prefix("https://").ok_or("API requires HTTPS")?;
+    let (authority, prefix) = rest.split_once('/').ok_or("full API base path required")?;
+    require(
+        prefix == "participant/v1/",
+        "expected /participant/v1/ base path",
+    )?;
+    let canonical = host(authority, "https")?;
+    require(
+        matches!(endpoint, "self" | "agents" | "events" | "messages"),
+        "unsupported endpoint",
+    )?;
+    let method = if body.is_some() { "POST" } else { "GET" };
+    let path = format!("/participant/v1/{endpoint}");
+    require(
+        body.is_none_or(|raw| raw.len() <= 32768),
+        "request body exceeds 32 KiB",
+    )?;
+    let mut command = Command::new("/usr/bin/curl");
+    command
+        .args([
+            "--disable",
+            "--silent",
+            "--show-error",
+            "--noproxy",
+            "*",
+            "--proto",
+            "=https",
+            "--max-redirs",
+            "0",
+            "--path-as-is",
+            "--globoff",
+            "--http1.1",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "40",
+            "--max-filesize",
+            "4194304",
+            "--dump-header",
+            "/dev/stderr",
+            "--write-out",
+            "\n%{http_code}",
+            "--request",
+            method,
+            "--cacert",
+        ])
+        .arg(ca);
+    if let Some(k) = signing_key {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs()
+            .to_string();
+        let message = signing(
+            method,
+            &canonical,
+            &path,
+            query,
+            &timestamp,
+            body.unwrap_or_default(),
+        );
+        command.arg("--header").arg(format!(
+            "Tolight-Key: {}",
+            URL_SAFE_NO_PAD.encode(k.verifying_key().as_bytes())
+        ));
+        command
+            .arg("--header")
+            .arg(format!("Tolight-Timestamp: {timestamp}"));
+        command.arg("--header").arg(format!(
+            "Tolight-Signature: {}",
+            URL_SAFE_NO_PAD.encode(k.sign(message.as_bytes()).to_bytes())
+        ));
+    }
+    if body.is_some() {
+        command.args([
+            "--header",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+        ]);
+    }
+    let suffix = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{query}")
+    };
+    command.arg(format!("{base}{endpoint}{suffix}"));
+    let output = runtime::capture(command, body.unwrap_or_default(), 45, false)?;
+    let headers = String::from_utf8_lossy(&output.stderr);
+    let retry = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find_map(|(k, v)| {
+            if k.eq_ignore_ascii_case("retry-after") {
+                v.trim().parse::<u64>().ok()
+            } else {
+                None
+            }
+        });
+
+    let split = output
+        .stdout
+        .iter()
+        .rposition(|&c| c == b'\n')
+        .ok_or("missing HTTP status")?;
+    let status: u16 = std::str::from_utf8(&output.stdout[split + 1..])?.parse()?;
+    let value = serde_json::from_slice(&output.stdout[..split]).ok();
+    require(!(300..400).contains(&status), "redirect refused")?;
+    Ok(WireResponse {
+        status,
+        retry_after: retry,
+        complete: output.status.success(),
+        value,
+        tls_fatal: matches!(output.status.code(), Some(51 | 58 | 60 | 77)),
+    })
+}
+fn request(
+    base: &str,
+    ca: &Path,
+    key_path: Option<&Path>,
+    endpoint: &str,
+    body: Option<&[u8]>,
+) -> Result<(u16, Value)> {
+    let signing_key = key_path.map(key).transpose()?;
+    let response = wire(base, ca, signing_key.as_ref(), endpoint, "", body)?;
+    if let Some(seconds) = response.retry_after {
+        eprintln!("Retry-After: {seconds}; this command does not retry");
+    }
+    require(
+        response.complete,
+        "HTTPS response incomplete; no automatic retry",
+    )?;
+    Ok((
+        response.status,
+        response.value.ok_or("invalid JSON response")?,
+    ))
+}
+fn main() -> Result<()> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["vectors", file] => vectors(Path::new(file)),
+        ["run", home] => runtime::run(Path::new(home)),
+        ["self", home] => runtime::fresh_self(Path::new(home)),
+        ["speak", home, recipient, topic, request_id] => {
+            runtime::speak(Path::new(home), recipient, topic, request_id)
+        }
+        ["model-check", home] => runtime::model_check(Path::new(home)),
+
+        ["probe", base, ca] => {
+            let (status, _) = request(base, Path::new(ca), None, "self", None)?;
+            require(status == 401, "expected unsigned self to be unauthorized")?;
+            println!(
+                "{}",
+                json!({"https_ca_and_target_verified": true, "unsigned_self_status": status, "authenticated": false, "application_submitted": false})
+            );
+            Ok(())
+        }
+
+        _ => {
+            eprintln!(
+                "tolink run STATE_DIRECTORY\ntolink self STATE_DIRECTORY\ntolink speak STATE_DIRECTORY RECIPIENT TOPIC OWNER_REQUEST_ID\ntolink model-check WORK_DIRECTORY\ntolink vectors FILE\ntolink probe HTTPS_BASE CA\nrun is a foreground worker; model-check generates without publishing. self uses the existing worker's single request lane when locked. speak requires the worker to be normally stopped first. No registration, scheduler or boot-service commands."
+            );
+            Err("invalid command".into())
+        }
+    }
+}
