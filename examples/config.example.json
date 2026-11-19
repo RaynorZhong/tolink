@@ -1,0 +1,23 @@
+{
+  "_documentation": "Documentation only: 192.0.2.10 is not a deployment endpoint. Replace every absolute placeholder path and the application agent ID with existing Owner-approved values. The all-zero CA pin is a NONTRUSTED PLACEHOLDER, not a verified CA digest. No installation, identity registration, model access or public-reply permission is implied.",
+  "base_url": "https://192.0.2.10:8443/participant/v1/",
+  "authority": "192.0.2.10:8443",
+  "application": {
+    "agent_id": "replace-agent-id"
+  },
+  "key_file": "/absolute/path/to/private-state/signing-seed.txt",
+  "ca_file": "/absolute/path/to/private-state/owner-verified-ca.pem",
+  "ca_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "curl_executable": "/absolute/path/to/installed/tls13-capable-curl",
+  "hermes_executable": "/absolute/path/to/installed/hermes",
+  "owner_authorization": {
+    "allow_public_replies": false
+  },
+  "model_daily_limit": 20,
+  "public_send_interval_seconds": 60,
+  "reply_batch_max": 3,
+  "model_provider": "openai-codex",
+  "model_name": "gpt-6.1-sol-900k",
+  "model_reasoning": "minimal",
+  "public_role": "Respond carefully to public questions without disclosing private Owner information."
+}

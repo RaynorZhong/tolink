@@ -113,6 +113,47 @@ impl Client {
         self.state["http_failures"][endpoint] = json!(0);
         Ok(Some((status, value)))
     }
+    fn discard_ineligible(&mut self, current: &Value) -> Result<()> {
+        if !current.is_object() {
+            return Ok(());
+        }
+        let invalid = |timeline: &Value| {
+            current["timeline"] != *timeline
+                || (timeline == "public"
+                    && (current["state"] != "ACTIVE"
+                        || !current["mute"].is_null()
+                        || current["room_paused"] != false))
+        };
+        let ids: Vec<String> = journal::receipts(&self.state)?
+            .iter()
+            .filter(|r| {
+                !journal::terminal_receipt(r["status"].as_str().unwrap_or(""))
+                    && invalid(&r["timeline"])
+            })
+            .filter_map(|r| r["event_id"].as_str().map(str::to_owned))
+            .collect();
+        for id in ids {
+            journal::decision(
+                &mut self.state,
+                &id,
+                "discarded",
+                "observed_self_ineligible",
+            )?;
+            let generation = &self.state["rust_generation"];
+            let work = if generation["intent"].is_object() {
+                &generation["intent"]
+            } else {
+                generation
+            };
+            if generation.is_object() && journal::work_ids(work)?.contains(&id) {
+                self.state["rust_generation"]["phase"] = json!("blocked_ineligible");
+            }
+        }
+        if self.state["pending"].is_object() && invalid(&self.state["pending"]["timeline"]) {
+            self.cancel_pending("observed_self_ineligible")?;
+        }
+        Ok(())
+    }
     pub(super) fn refresh_self(&mut self) -> Result<Option<Value>> {
         let Some((status, value)) = self.call("self", "", None)? else {
             return Ok(None);
@@ -141,18 +182,24 @@ impl Client {
         )?;
         self.state["self"] = value.clone();
         self.state["self_checked_epoch"] = json!(now());
+        self.discard_ineligible(&value)?;
         self.save()?;
         Ok(Some(value))
     }
     pub(super) fn cancel_pending(&mut self, reason: &str) -> Result<()> {
+        self.finish_pending(reason, false)
+    }
+    fn finish_pending(&mut self, reason: &str, conclusive_rejection: bool) -> Result<()> {
         if self.state["pending"].is_null() {
             return Ok(());
         }
         let mut pending = self.state["pending"].clone();
         let trigger = text(&pending, "trigger_id")?.to_owned();
-        // A cancelled ambiguous attempt remains evidence, never a fresh sendable draft.
-        let uncertain = pending["attempts"].as_u64().is_none_or(|n| n > 0);
-        pending["state"] = json!(if uncertain {
+        // A complete known rejection differs from cancelling an ambiguous attempt.
+        let uncertain = !conclusive_rejection && pending["attempts"].as_u64().is_none_or(|n| n > 0);
+        pending["state"] = json!(if conclusive_rejection {
+            "rejected"
+        } else if uncertain {
             "delivery_unknown_cancelled"
         } else {
             "cancelled_before_attempt"
@@ -165,8 +212,8 @@ impl Client {
         self.state["verifications"]
             .as_array_mut()
             .ok_or("missing verification journal")?
-            .push(pending);
-        journal::decision(&mut self.state, &trigger, "discarded", reason)?;
+            .push(pending.clone());
+        journal::decide_work(&mut self.state, &pending, "discarded", reason)?;
         self.state["pending"] = Value::Null;
         journal::prune(&mut self.state)?;
         self.save()?;
@@ -202,12 +249,17 @@ impl Client {
         if current["timeline"] != pending["timeline"] || !allowed {
             return self.cancel_pending("self_state_changed_before_send");
         }
-        if contains(
-            &self.state,
-            "retracted_event_ids",
-            text(&pending, "trigger_id")?,
-        ) {
-            return self.cancel_pending("trigger_retracted_before_send");
+        for id in journal::work_ids(&pending)? {
+            if contains(&self.state, "retracted_event_ids", &id) {
+                return self.cancel_pending("trigger_retracted_before_send");
+            }
+            if journal::receipts(&self.state)?
+                .iter()
+                .find(|r| r["event_id"] == id)
+                .is_some_and(|r| r["status"] != "draft")
+            {
+                return self.cancel_pending("trigger_no_longer_eligible_before_send");
+            }
         }
         let validation_intent = json!({"kind":if pending["required_recipient"].is_string(){"outreach"}else{"reply"},"recipient_id":pending["required_recipient"],"allowed_mentions":pending["allowed_mentions"],"max_text_scalars":current["limits"]["max_text_scalars"]});
         if journal::validate_result(&validation_intent, text(&pending["body"], "text")?).is_err() {
@@ -253,7 +305,25 @@ impl Client {
                 .as_str()
                 .unwrap_or("unknown")
                 .to_owned();
-            self.cancel_pending(&format!("server_rejected:{code}"))?;
+            let known = matches!(
+                (status, code.as_str()),
+                (400, "bad_request")
+                    | (413, "too_large")
+                    | (
+                        422,
+                        "content_rejected" | "invalid_mention" | "too_many_mentions"
+                    )
+                    | (409, "room_paused")
+                    | (403, "agent_muted" | "agent_not_active")
+            );
+            require(
+                known,
+                "unknown POST status/error; original pending retained; stopped",
+            )?;
+            let first_attempt = self.state["pending"]["attempts"] == 1;
+            // Public 422 replay is conclusive too; other state errors may follow an earlier lost ACK.
+            let conclusive = first_attempt || (pending["timeline"] == "public" && status == 422);
+            self.finish_pending(&format!("server_rejected:{code}"), conclusive)?;
             return Ok(());
         }
         self.state["last_message_result"] = json!({"at":utc()?,"http_status":status,"response":ack,"client_message_id":pending["body"]["client_message_id"],"timeline":pending["timeline"]});
@@ -266,7 +336,12 @@ impl Client {
             .as_array()
             .ok_or("missing verification journal")?
             .iter()
-            .position(|j| j["state"] == "accepted" && number(j, "next_check_epoch") <= now());
+            .enumerate()
+            .filter(|(_, j)| j["state"] == "accepted" && number(j, "next_check_epoch") <= now())
+            .min_by(|(_, a), (_, b)| {
+                number(a, "next_check_epoch").total_cmp(&number(b, "next_check_epoch"))
+            })
+            .map(|(index, _)| index);
         let Some(index) = index else { return Ok(()) };
         let job = self.state["verifications"][index].clone();
         let query = if let Some(cursor) = job["verification_cursor"].as_str() {
@@ -302,11 +377,14 @@ impl Client {
         if result.is_err() {
             checked["last_error"] = json!("malformed_or_unusable_verification_page");
         }
-        checked["next_check_epoch"] = json!(if page["has_more"] == true {
-            now()
-        } else {
-            now() + 30.0
-        });
+        let observed = page["events"]
+            .as_array()
+            .and_then(|events| events.iter().filter_map(|e| e["seq"].as_u64()).max());
+        let backlog = page["head_seq"]
+            .as_u64()
+            .zip(observed)
+            .is_some_and(|(head, seen)| seen < head);
+        checked["next_check_epoch"] = json!(if backlog { now() } else { now() + 30.0 });
         let outcome = checked["state"].clone();
         let id = checked["accepted"]["event_id"].clone();
         let index = self.state["verifications"]
@@ -351,10 +429,18 @@ impl Client {
                 r["event"]["text"] = Value::Null;
             }
             journal::decision(&mut self.state, &id, "retracted", "trigger_retracted")?;
-            if self.state["pending"]["trigger_id"] == id {
+            if self.state["pending"].is_object()
+                && journal::work_ids(&self.state["pending"])?.contains(&id)
+            {
                 self.cancel_pending("trigger_retracted_before_send")?;
             }
-            if self.state["rust_generation"]["intent"]["trigger_id"] == id {
+            let generation = &self.state["rust_generation"];
+            let work = if generation["intent"].is_object() {
+                &generation["intent"]
+            } else {
+                generation
+            };
+            if generation.is_object() && journal::work_ids(work)?.contains(&id) {
                 self.state["rust_generation"]["phase"] = json!("blocked_retracted");
             }
         }
@@ -438,6 +524,8 @@ impl Client {
                 }
             }
         }
+        let current = self.state["self"].clone();
+        self.discard_ineligible(&current)?;
         // One save commits ALL new receipts and the page's consumption cursor before a model call.
         self.state["cursor"] = json!(cursor);
         journal::prune(&mut self.state)?;
@@ -450,10 +538,64 @@ impl Client {
         }
         Ok(())
     }
+    fn select_receipts(&self, first: &Value, current: &Value) -> Result<Vec<Value>> {
+        let limit = match self.config.get("reply_batch_max") {
+            None => 3,
+            Some(v) => v
+                .as_u64()
+                .filter(|n| (1..=3).contains(n))
+                .ok_or("reply_batch_max must be 1..3")? as usize,
+        };
+        let mut selected = vec![first.clone()];
+        if limit == 1
+            || first["kind"] != "reply"
+            || first["timeline"] != "public"
+            || !first["source_cursor"].is_string()
+        {
+            return Ok(selected);
+        }
+        let max_people = current["limits"]["max_mentions_per_message"]
+            .as_u64()
+            .unwrap_or(1)
+            .min(3) as usize;
+        let mut people =
+            std::collections::BTreeSet::from([
+                text(&first["event"]["agent"], "agent_id")?.to_owned()
+            ]);
+        for receipt in journal::receipts(&self.state)? {
+            if selected.len() >= limit {
+                break;
+            }
+            if receipt["event_id"] == first["event_id"]
+                || receipt["status"] != "received"
+                || receipt["kind"] != "reply"
+                || receipt["timeline"] != first["timeline"]
+                || receipt["source_cursor"] != first["source_cursor"]
+                || contains(
+                    &self.state,
+                    "retracted_event_ids",
+                    text(receipt, "event_id")?,
+                )
+            {
+                continue;
+            }
+            let author = text(&receipt["event"]["agent"], "agent_id")?;
+            if !people.contains(author) && people.len() >= max_people {
+                continue;
+            }
+            people.insert(author.to_owned());
+            selected.push(receipt.clone());
+        }
+        selected.sort_by_key(|r| r["event"]["seq"].as_u64().unwrap_or(0));
+        Ok(selected)
+    }
     pub(super) fn generate_receipt(&mut self, receipt: &Value, current: &Value) -> Result<()> {
         if !self.state["rust_generation"].is_null() || !self.state["pending"].is_null() {
             return Ok(());
         }
+        let selected = self.select_receipts(receipt, current)?;
+        let receipt = selected.last().ok_or("empty selected work")?;
+        let work = json!({"trigger_id":receipt["event_id"],"trigger_ids":selected.iter().map(|r|r["event_id"].clone()).collect::<Vec<_>>()});
         let receipt_id = text(receipt, "event_id")?;
         if contains(&self.state, "retracted_event_ids", receipt_id)
             || !journal::receipts(&self.state)?
@@ -466,17 +608,12 @@ impl Client {
             && receipt["kind"] != "outreach"
             && self.config["owner_authorization"]["allow_public_replies"] != true
         {
-            journal::decision(
+            journal::decide_work(
                 &mut self.state,
-                receipt_id,
+                &work,
                 "discarded",
                 "public_replies_not_authorized",
             )?;
-            self.save()?;
-            return Ok(());
-        }
-        let day = OffsetDateTime::now_utc().date().to_string();
-        if journal::budget(&mut self.state, &self.config, &day)?["reason"] != "available" {
             self.save()?;
             return Ok(());
         }
@@ -488,12 +625,17 @@ impl Client {
                     || !current["mute"].is_null()
                     || current["room_paused"] != false))
         {
-            journal::decision(
+            journal::decide_work(
                 &mut self.state,
-                &id,
+                &work,
                 "discarded",
                 "self_state_changed_before_generation",
             )?;
+            self.save()?;
+            return Ok(());
+        }
+        let day = self.budget_day();
+        if journal::budget(&mut self.state, &self.config, &day)?["reason"] != "available" {
             self.save()?;
             return Ok(());
         }
@@ -501,9 +643,9 @@ impl Client {
             return Ok(());
         };
         if status != 200 || agents["timeline"] != timeline {
-            journal::decision(
+            journal::decide_work(
                 &mut self.state,
-                &id,
+                &work,
                 "discarded",
                 "participant_timeline_changed",
             )?;
@@ -515,7 +657,30 @@ impl Client {
         while serde_json::to_vec(&context)?.len() > 80_000 {
             context.as_array_mut().ok_or("bad context")?.remove(0);
         }
-        let mut payload = json!({"notice":receipt["notice"],"identity":{"agent_id":current["agent_id"],"display_name":current["display_name"],"bio":current["bio"]},"timeline":timeline,"participants":agents["agents"],"context":context,"trigger":receipt["event"],"max_text_scalars":current["limits"]["max_text_scalars"]});
+        let authors: std::collections::BTreeSet<String> = selected
+            .iter()
+            .filter_map(|r| r["event"]["agent"]["agent_id"].as_str().map(str::to_owned))
+            .collect();
+        let roster = agents["agents"].as_array().ok_or("roster missing")?;
+        let essential = |a: &&Value| {
+            a["agent_id"] == current["agent_id"]
+                || a["agent_id"]
+                    .as_str()
+                    .is_some_and(|id| authors.contains(id))
+        };
+        let mut participants: Vec<Value> = roster
+            .iter()
+            .filter(essential)
+            .map(|a| public_agent(a))
+            .collect();
+        participants.extend(
+            roster
+                .iter()
+                .filter(|a| !essential(a))
+                .take(32usize.saturating_sub(participants.len()))
+                .map(public_agent),
+        );
+        let mut payload = json!({"notice":receipt["notice"],"identity":{"agent_id":current["agent_id"],"display_name":current["display_name"],"bio":current["bio"]},"timeline":timeline,"participants":participants,"context":context,"trigger":receipt["event"],"triggers":selected.iter().map(|r|r["event"].clone()).collect::<Vec<_>>(),"max_text_scalars":current["limits"]["max_text_scalars"]});
         let outreach = receipt["kind"] == "outreach";
         let target = if outreach {
             text(receipt, "recipient_id")?
@@ -541,10 +706,42 @@ impl Client {
             payload["recipient"] = recipient.clone();
             payload["owner_topic"] = receipt["owner_topic"].clone();
         }
-        let intent = json!({"kind":if outreach{"outreach"}else{"reply"},"trigger_id":id,"timeline":timeline,"reply_to_event_id":if outreach{Value::Null}else{json!(id)},"recipient_id":if outreach{json!(target)}else{Value::Null},"allowed_mentions":[target],"max_text_scalars":current["limits"]["max_text_scalars"]});
+        require(
+            self.config["public_role"]
+                .as_str()
+                .is_none_or(|r| r.len() <= 4096),
+            "public_role exceeds 4096 bytes",
+        )?;
+        while serde_json::to_vec(&payload)?.len() > 90_000 {
+            let context = payload["context"]
+                .as_array_mut()
+                .ok_or("invalid model context")?;
+            if context.is_empty() {
+                return Err("bounded public model payload still exceeds admission limit".into());
+            }
+            context.remove(0);
+        }
+        let allowed: std::collections::BTreeSet<String> = if outreach {
+            std::collections::BTreeSet::from([target.to_owned()])
+        } else {
+            authors
+        };
+        let reply_mentions: Vec<String> = if outreach {
+            vec![]
+        } else {
+            allowed
+                .iter()
+                .filter(|id| {
+                    id.as_str() != target && roster.iter().any(|a| a["agent_id"] == id.as_str())
+                })
+                .cloned()
+                .collect()
+        };
+        let intent = json!({"kind":if outreach{"outreach"}else{"reply"},"trigger_id":id,"trigger_ids":work["trigger_ids"],"timeline":timeline,"reply_to_event_id":if outreach{Value::Null}else{json!(id)},"reply_mentions":reply_mentions,"recipient_id":if outreach{json!(target)}else{Value::Null},"allowed_mentions":allowed,"max_text_scalars":current["limits"]["max_text_scalars"]});
         let generation =
             json!({"generation_id":token()?,"started_at":utc()?,"phase":"started","intent":intent});
-        journal::reserve(&mut self.state, &self.config, &day, generation)?;
+        let reservation_day = self.budget_day();
+        journal::reserve(&mut self.state, &self.config, &reservation_day, generation)?;
         self.save()?;
         self.log("model_start",json!({"generation_id":self.state["rust_generation"]["generation_id"],"trigger_id":id,"tools":0,"model":self.config["model_name"].as_str().unwrap_or("gpt-6.1-sol-900k")}))?;
         #[cfg(test)]
@@ -567,16 +764,20 @@ impl Client {
                     self.state["rust_generation"]["phase"] = json!("result_rejected");
                     self.state["rust_generation"]["result"] = json!(reply);
                     self.state["rust_generation"]["reason"] = json!(error.to_string());
-                    if let Some(r) = journal::receipt_mut(&mut self.state, &id) {
-                        r["status"] = json!("generation_unknown");
+                    for selected_id in journal::work_ids(&work)? {
+                        if let Some(r) = journal::receipt_mut(&mut self.state, &selected_id) {
+                            r["status"] = json!("generation_unknown");
+                        }
                     }
                 }
             }
             Err(error) => {
                 self.state["rust_generation"]["phase"] = json!("unknown");
                 self.state["rust_generation"]["reason"] = json!("native_model_failed_or_timed_out");
-                if let Some(r) = journal::receipt_mut(&mut self.state, &id) {
-                    r["status"] = json!("generation_unknown");
+                for selected_id in journal::work_ids(&work)? {
+                    if let Some(r) = journal::receipt_mut(&mut self.state, &selected_id) {
+                        r["status"] = json!("generation_unknown");
+                    }
                 }
                 self.save()?;
                 // Process cleanup errors must never be followed by another owned invocation.
@@ -611,7 +812,12 @@ impl Client {
             &self.config,
             &OffsetDateTime::now_utc().date().to_string(),
         )?;
-        Ok((!self.state["pending"].is_null() && self.ready(true))
+        let verification_due = self.state["verifications"].as_array().is_some_and(|jobs| {
+            jobs.iter()
+                .any(|j| j["state"] == "accepted" && number(j, "next_check_epoch") <= now())
+        });
+        Ok(verification_due
+            || (!self.state["pending"].is_null() && self.ready(true))
             || (self.state["rust_generation"].is_null()
                 && self.state["pending"].is_null()
                 && budget["reason"] == "available"
@@ -623,7 +829,7 @@ impl Client {
         self.save()?;
         save(
             &self.home.join("process.json"),
-            &json!({"pid":std::process::id(),"started_at":utc()?,"state":"running","implementation":"rust"}),
+            &json!({"pid":std::process::id(),"started_at":utc()?,"state":"running","implementation":"rust","build":crate::diagnostics::build_info()}),
         )?;
         self.log("started",json!({"pid":std::process::id(),"agent_id":self.config["application"]["agent_id"],"interval_seconds":self.config["public_send_interval_seconds"],"proactive":false}))?;
         println!(

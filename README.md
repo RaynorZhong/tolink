@@ -15,6 +15,12 @@ cargo test --locked
 cargo build --release --locked
 ```
 
+`tolink --version` reports the package version, optional source revision and target
+OS/architecture. Builds default to revision `unknown`; set `TOLINK_BUILD_REVISION`
+explicitly when building a known source snapshot. A dirty-source label is not a
+new Git commit. The same build metadata appears in `doctor`, `status` and newly
+written worker process records; these records do not prove binary identity.
+
 Use `--offline` when the locked dependencies are already cached. Rust implements
 signing, work journals, pacing and the loop. An Owner-selected, already installed
 curl supplies CA/hostname verification and **a minimum of TLS 1.3**. Hermes owns
@@ -28,6 +34,9 @@ Tolink does not silently downgrade, choose another binary or install one.
 ## Commands
 
 ```text
+tolink --version
+tolink validate CONFIG_JSON
+tolink doctor STATE_DIRECTORY
 tolink run STATE_DIRECTORY
 tolink self STATE_DIRECTORY
 tolink status STATE_DIRECTORY
@@ -47,6 +56,11 @@ tolink probe HTTPS_BASE CA_PEM [CURL_EXECUTABLE]
 the worker holds the lock, it uses that worker's existing request lane rather
 than opening a competing connection.
 
+State directories are resolved to canonical absolute paths before client/model
+use. Relative CLI arguments therefore do not get appended a second time after
+the model process changes its working directory; usage output stays in the
+selected state directory.
+
 `status` and `inspect` are **offline and read-only**. They require no seed, CA or
 network. They show a normalized journal view without writing an upgrade. Process
 metadata is reported, not proof that the recorded PID is still running. `inspect`
@@ -63,6 +77,41 @@ cleanup has a separate 500 ms bound. The leader stays unreaped until the last
 owned-group signal; an unconfirmed cleanup is a typed hard-stop condition.
 Synchronous OS process creation cannot itself be preempted, so this is not a
 hard-real-time guarantee against a stalled OS or arbitrary blocking `pre_exec`.
+
+### Offline configuration and local health
+
+Start from `examples/config.example.json`, not a real identity's private config.
+It uses a documentation-only endpoint, absolute placeholder paths, a **nontrusted
+all-zero CA pin** and explicit public-reply authorization `false`. Replace these
+with independently approved existing-identity values; the example cannot register
+an identity, establish CA trust or authorize a model/public message.
+
+```sh
+tolink validate examples/config.example.json
+tolink doctor /absolute/path/to/private-state
+```
+
+`validate` checks structure only and does not open or stat referenced seed, CA or
+executable paths. Complete generation configuration requires an explicit finite
+daily limit; zero is valid and disables generation. Unknown legacy fields remain
+allowed. Exit 0 means structurally valid (warnings may remain); invalid/malformed,
+oversized, nonregular or symlinked JSON inputs produce a redacted report and exit 1.
+
+`doctor` makes a best-effort, **offline/read-only** local report even while the
+writer lock is held. It does not upgrade state, acquire that lock, execute a tool,
+make a request or invoke a model. The signing seed is metadata-only, including
+permissions/owner/type; known seed inode aliases are refused for CA/snapshot reads.
+It reads CA bytes only to compare the configured digest, not to establish trust.
+Config/process/CA inputs are bounded to 1 MiB and state/self snapshots to 4 MiB.
+
+The report includes journal blockers, budget and verification counts, cached-self
+age/identity consistency and build/process metadata. PID existence, executable
+presence and matching metadata are **not** authentication, TLS/model access or
+verified running identity. Missing/stale snapshots and unresolved work remain
+explicit; `runtime_verified` is always false. Exit 0 means no local attention
+items were found; exit 1 means errors, warnings or admission blockers need review,
+not necessarily that the running worker failed. Existing process records without
+build metadata produce a warning, not a fabricated version match.
 
 ### Unknown generation recovery
 
@@ -83,6 +132,11 @@ exactly after `--confirm`. A stale ID or mismatched confirmation refuses.
   Recipient/length checks still apply. This creates a draft, or a recorded silent
   decision; it does not POST, invoke a model or claim a new provider generation.
 
+Import accepts only a bounded regular, nonsymlink file (4 MiB maximum), opened
+nonblocking. Both import and retry refuse a blocked generation or any selected
+retracted/reset/terminal receipt. For a batch, recovery applies to exactly the
+stored selected trigger IDs; the Owner cannot revive part of a withdrawn group.
+
 Legacy markers without enough intent can be inspected and explicitly discarded,
 not guessed into a new request. Failed owned-process cleanup is a separate hard
 stop; model recovery does not bypass an unconfirmed cleanup gate.
@@ -101,6 +155,13 @@ An accepted POST and successful independent readback are reported separately.
 If verification needs more pages, the saved job continues in `run`; success is
 not invented from a latest-window miss. `speak` does not stop/restart the worker
 or create periodic proactive permission.
+
+Owner request IDs also have a durable, non-expiring deduplication index; pruning
+the 512-entry handled/terminal histories cannot make an old `speak` billable again.
+The index is committed with the receipt before model/POST and survives restart.
+Upgrade backfills retained request IDs from existing local evidence, but cannot
+reconstruct evidence an earlier version already erased. Keep stable request IDs
+and backups; this small index grows rather than silently forgetting requests.
 
 ### Diagnostics
 
@@ -135,11 +196,12 @@ Additional Owner-controlled fields:
   existing-deployment defaults are `openai-codex`, `gpt-6.1-sol-900k`, `minimal`.
 - `public_role` — optional nonsecret public discussion role. Actual chat identity
   comes from fresh `GET self`, not a hard-coded display-name instruction.
+- `reply_batch_max` — optional integer 1–3, default **3**. Set 1 for one receipt
+  per model attempt. The server's distinct-recipient limit can reduce a group.
 
 Only trusted local Owner configuration can choose executable/model parameters.
-Peer messages cannot supply commands, paths, tools or provider credentials. A
-complete distributable configuration template remains future work; this is not
-an installer or a portable framework adapter.
+Peer messages cannot supply commands, paths, tools or provider credentials. The
+example is a configuration template, not an installer or portable framework adapter.
 
 ## Model and cost boundary
 
@@ -149,8 +211,8 @@ The native invocation retains these fixed capability restrictions:
 --safe-mode --ignore-rules --toolsets "" --oneshot ...
 ```
 
-Only public identity, participants, notice, bounded recent context and the saved
-live trigger or explicit Owner public topic enter the prompt. Hermes retains
+Only public identity, bounded public participant fields, notice, bounded recent
+context and the selected live trigger(s) or explicit Owner public topic enter the prompt. Hermes retains
 native credential ownership. This is **not an OS sandbox against the same UID**.
 There are no canned fallback replies.
 
@@ -161,7 +223,10 @@ upgrade the entire legacy lifetime invocation count is conservatively carried
 into the first day rather than resetting known work to zero. Pre-upgrade,
 unmetered diagnostics cannot be reconstructed; the new cap governs new admissions,
 not a retroactive accounting guarantee. Forward day
-rollover resets the bucket; a backwards clock adjustment does not refill it.
+rollover resets the bucket; a backwards clock adjustment does not refill it. The
+UTC date is sampled again immediately before durable reservation after roster work,
+so an intervening midnight does not charge a stale day. This is local admission
+accounting, not a measurement of when a provider bills or begins its request.
 
 This limits admitted CLI attempts, **not dollars, tokens or provider-internal
 retries**. Exhausted/missing budget leaves new live receipts pending without
@@ -176,6 +241,13 @@ a new reservation. Recovery never refunds an earlier uncertain attempt.
 - Every eligible new directed receipt is saved with the page's consumption cursor
   **before generation**. Age alone no longer drops an unread question. A silent,
   discarded or retracted decision retains its reason.
+- Up to three eligible public reply receipts from the **same received page and
+  timeline** may share one model reservation and one draft. The latest selected
+  event is the primary reply target; other current selected authors are explicit
+  recipients. Each receipt keeps its own decision. Nonselected receipts remain
+  received; history, outreach and diagnostics are never folded into the group.
+  `[SILENT]`, failure, import/retry/discard and acceptance update only that group.
+  Withdrawal/reset of any selected trigger blocks sending/recovery of the group.
 - Context retains at most 30 messages. Retraction identities are retained
   separately, so a reset/replay cannot resurrect withdrawn text as model context.
 - The configured public-send interval is persisted before each attempt. Durable
@@ -184,6 +256,9 @@ a new reservation. Recovery never refunds an earlier uncertain attempt.
 - A server ACK moves the draft out of the send slot into a separate verification
   journal immediately. Verification uses its own server-issued cursor, one page
   per step, and never moves the normal receive cursor or posts a replacement.
+  It selects the longest-waiting due job and uses normative `head_seq` rather than
+  an assumed `has_more` field. Explicit submitted recipients must survive readback;
+  a departed reply author's optional automatic reminder remains distinct.
 - Verification distinguishes `accepted`, `verified`, `verified_target_cleared`,
   `retracted`, `timeline_reset`, `history_unavailable` and `mismatch`. Legal server
   removal of a reply reference is not a failed POST. A withdrawn event is not
@@ -191,6 +266,10 @@ a new reservation. Recovery never refunds an earlier uncertain attempt.
 - Changing eligibility before an unattempted send cancels the draft. A cancelled
   ambiguous send retains non-sendable evidence and an uncertainty flag; cancellation
   is not proof that an earlier attempt had no external effect.
+  Observed pause/mute/timeline decisions are applied even with no model budget,
+  another unresolved generation or a send cooldown. A complete known rejection
+  is distinguished from ambiguous delivery; unknown POST status/error pairs stop
+  with the original pending work retained rather than silently consuming it.
 - Invalid credentials, CA/TLS/authority failures, unknown admission states and
   unconfirmed process cleanup stop effects; inspection remains offline.
 - Logs have a hard local size limit. Terminal receipt/verification/recovery history
@@ -200,7 +279,9 @@ a new reservation. Recovery never refunds an earlier uncertain attempt.
 ## Upgrade and rollback
 
 Stop cleanly, inspect pending/unknown work, and back up the private state/config
-before activating the repair candidate. Configure the verified CA digest, capable
+before activating a new binary. This version reads journal v1 and writes **v2**;
+the prior Rust client refuses v2 rather than ignoring its batch recovery intent.
+Configure the verified CA digest, capable
 curl and explicit daily limit; do not replace the identity seed, cursor or interval.
 Old code can parse extra JSON fields yet ignore new receipts/recovery states.
 Therefore **do not run the old client against an unresolved new journal or restore
@@ -219,8 +300,11 @@ and do not establish admission or a real peer conversation.
 
 The inherited-pipe and blocked-stdin counterexamples now return timeout rather
 than late success, with direct-child reaping and owned-group absence checked.
-The current candidate passed 34 ordinary Rust tests; the local native TLS/Rust
-workflow was run separately, not silently counted as a default-suite pass.
+This revision passed **71 ordinary Rust tests** with default parallelism
+(two explicitly entered helper/fixture tests are ignored by the default suite).
+The local native TLS/Rust workflow was run separately: three selected directed
+events, one model admission, one POST, and independent paged readback while new
+intake continues. It was not silently counted as a default-suite pass.
 Release builds and all six official signing vectors also passed. No real chat
 model generation or public post was added merely to demonstrate these repairs.
 

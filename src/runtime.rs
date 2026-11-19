@@ -57,16 +57,24 @@ fn load(path: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 fn save(path: &Path, value: &Value) -> Result<()> {
-    let temporary = path.with_extension(format!("rust-tmp-{}", std::process::id()));
+    let temporary = path.with_extension(format!("rust-tmp-{}-{}", std::process::id(), token()?));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&temporary)?;
-    file.write_all(&serde_json::to_vec(value)?)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
+    let committed = (|| -> Result<()> {
+        file.write_all(&serde_json::to_vec(value)?)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if let Err(error) = committed {
+        // Only this invocation's exclusively created, not-yet-renamed temp is ours.
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
     File::open(path.parent().ok_or("missing parent")?)?.sync_all()?;
     Ok(())
 }
@@ -99,8 +107,14 @@ pub(super) fn capture(
     crate::process::capture(command, input, seconds, interruptible, &STOP)
 }
 fn model(home: &Path, config: &Value, payload: &Value) -> Result<String> {
+    let home = fs::canonicalize(home)?;
     let task = if payload.get("owner_topic").is_some() {
         "Owner本次明确授权主动向recipient发起讨论。围绕owner_topic开启一个新话题，不把历史消息当作刚收到的提问；先提出一个具体看法，再向对方问一个容易回应的问题，约200至400字，不虚构对方说过的话。只提及指定recipient，正文必须以其@agent_id开头。不公开Owner私人信息、本机实现或本机运行情况。"
+    } else if payload["triggers"]
+        .as_array()
+        .is_some_and(|items| items.len() > 1)
+    {
+        "triggers是同页选中的几个新定向问题，只用一份简洁回复处理这一组。trigger是该组最新的主要问题，先直接回答它，再补充其他具体问题；不要把其他历史上下文当作刚收到的提问。reply_to由客户端关联主trigger；只提及本组作者，不添加其他收件人。整组无新信息时只返回[SILENT]。"
     } else {
         "直接回应trigger的具体问题；无新信息时只返回[SILENT]。"
     };
@@ -142,7 +156,7 @@ fn model(home: &Path, config: &Value, payload: &Value) -> Result<String> {
         }
     }
     command
-        .current_dir(home)
+        .current_dir(&home)
         .args([
             "--safe-mode",
             "--ignore-rules",
@@ -169,6 +183,15 @@ fn model(home: &Path, config: &Value, payload: &Value) -> Result<String> {
     Ok(String::from_utf8(result.stdout)?.trim().to_owned())
 }
 
+fn public_agent(agent: &Value) -> Value {
+    let mut result = serde_json::Map::new();
+    for field in ["agent_id", "display_name", "bio", "joined_at"] {
+        if let Some(value) = agent.get(field) {
+            result.insert(field.into(), value.clone());
+        }
+    }
+    Value::Object(result)
+}
 fn public_event(event: &Value) -> Value {
     let mut result = serde_json::Map::new();
     for field in [
@@ -215,7 +238,8 @@ struct Client {
 }
 impl Client {
     fn open(home: &Path) -> Result<Self> {
-        let guard = lock(home)?;
+        let home = fs::canonicalize(home)?;
+        let guard = lock(&home)?;
         let config = load(&home.join("config.json"))?;
         let authority = text(&config, "base_url")?
             .strip_prefix("https://")
@@ -246,7 +270,7 @@ impl Client {
         let send_gate = Instant::now()
             + Duration::from_secs_f64((number(&state, "next_public_send_epoch") - now()).max(0.0));
         Ok(Self {
-            home: home.to_owned(),
+            home,
             config,
             state,
             key,
@@ -259,6 +283,13 @@ impl Client {
     }
     fn save(&self) -> Result<()> {
         save(&self.home.join("state.json"), &self.state)
+    }
+    fn budget_day(&self) -> String {
+        #[cfg(test)]
+        if let Some(day) = self.script.as_ref().and_then(|s| s.budget_day.as_ref()) {
+            return day.clone();
+        }
+        OffsetDateTime::now_utc().date().to_string()
     }
     fn log(&self, event: &str, fields: Value) -> Result<()> {
         let path = self.home.join("rust-client.log");
@@ -311,7 +342,7 @@ pub(super) fn run(home: &Path) -> Result<()> {
     client.log("stopped", json!({"reason":reason}))?;
     save(
         &home.join("process.json"),
-        &json!({"pid":std::process::id(),"stopped_at":utc()?,"state":"stopped","reason":reason,"implementation":"rust"}),
+        &json!({"pid":std::process::id(),"stopped_at":utc()?,"state":"stopped","reason":reason,"implementation":"rust","build":crate::diagnostics::build_info()}),
     )?;
     if clean_stop { Ok(()) } else { result }
 }
@@ -319,6 +350,9 @@ pub(super) use operations::{fresh_self, inspect, model_check, recover, speak, st
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("correctness_tests.rs");
+    include!("batch_tests.rs");
+    include!("publication_tests.rs");
     #[test]
     fn unusable_verification_page_does_not_stop_receipt_intake() {
         let mut c = fixture_client();
@@ -357,6 +391,8 @@ mod tests {
         model_failure: bool,
         generation_calls: usize,
         model_trigger: String,
+        pub(super) budget_day: Option<String>,
+        day_after_agents: Option<String>,
     }
     impl Script {
         fn new(requests: Vec<(&'static str, &'static str, WireResponse)>) -> Self {
@@ -367,6 +403,8 @@ mod tests {
                 model_failure: false,
                 generation_calls: 0,
                 model_trigger: "fixture-question".into(),
+                budget_day: None,
+                day_after_agents: None,
             }
         }
         pub(super) fn request(
@@ -382,6 +420,11 @@ mod tests {
                 .expect("unexpected fixture request; will never fall through to real wire");
             assert_eq!(endpoint, expected_endpoint);
             assert_eq!(query, expected_query);
+            if endpoint == "agents" {
+                if let Some(day) = self.day_after_agents.take() {
+                    self.budget_day = Some(day);
+                }
+            }
             if endpoint == "messages" {
                 let disk = load(&home.join("state.json"))?;
                 assert_eq!(disk["pending"]["body"], *payload.expect("POST body"));
@@ -400,17 +443,19 @@ mod tests {
         }
         pub(super) fn generate(&mut self, home: &Path) -> Result<String> {
             let disk = load(&home.join("state.json"))?;
-            assert_eq!(
-                disk["rust_generation"]["intent"]["trigger_id"],
-                self.model_trigger
-            );
+            let actual_trigger = disk["rust_generation"]["intent"]["trigger_id"]
+                .as_str()
+                .ok_or("fixture intent trigger missing")?;
+            if self.model_trigger != "*" {
+                assert_eq!(actual_trigger, self.model_trigger);
+            }
             assert!(disk["model_budget"]["used"].as_u64().unwrap() > 0);
             assert!(
                 disk["inbox"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|r| r["event_id"] == self.model_trigger && r["status"] == "generating")
+                    .any(|r| r["event_id"] == actual_trigger && r["status"] == "generating")
             );
             self.generation_calls += 1;
             if self.model_failure {
@@ -451,7 +496,7 @@ mod tests {
         Client {
             _lock: lock(&home).unwrap(),
             home,
-            config: json!({"owner_authorization":{"allow_public_replies":true},"application":{"agent_id":"fixture-agent"},"public_send_interval_seconds":60}),
+            config: json!({"owner_authorization":{"allow_public_replies":true},"application":{"agent_id":"fixture-agent"},"public_send_interval_seconds":60,"reply_batch_max":1}),
             state: json!({"cursor":"fixture-before","timeline":"public","context":[],"handled":[],"own_event_ids":[],"pending":null,"model_invocations":0}),
             key: SigningKey::from_bytes(&seed),
             request_gate: Instant::now(),
@@ -530,7 +575,7 @@ mod tests {
                 "after=pre-post-server-cursor&limit=50",
                 response(
                     200,
-                    json!({"timeline":"public","next_cursor":"page-two-server-cursor","has_more":true,"events":[{"event_id":"unrelated","seq":79}]}),
+                    json!({"timeline":"public","next_cursor":"page-two-server-cursor","head_seq":80,"events":[{"event_id":"unrelated","seq":79}]}),
                 ),
             ),
             (
@@ -736,6 +781,7 @@ mod tests {
         seed_client.config["model_name"] = json!("fixture-model");
         seed_client.config["public_role"] = json!("native fixture role");
         seed_client.config["model_daily_limit"] = json!(1);
+        seed_client.config["reply_batch_max"] = json!(3);
         seed_client.state["cursor"] = json!("server-cursor-0");
         save(&home.join("config.json"), &seed_client.config).unwrap();
         seed_client.save().unwrap();
@@ -749,9 +795,13 @@ mod tests {
             .unwrap();
         c.page(&page, true).unwrap();
         assert_eq!(c.state["cursor"], "server-cursor-15");
-        assert_eq!(c.state["inbox"].as_array().unwrap().len(), 1);
+        assert_eq!(c.state["inbox"].as_array().unwrap().len(), 3);
         c.generate_one().unwrap();
         assert_eq!(c.state["pending"]["body"]["text"], "answer");
+        assert_eq!(
+            c.state["pending"]["trigger_ids"].as_array().unwrap().len(),
+            3
+        );
         assert_eq!(
             load(&home.join("native-model-observed.json")).unwrap()["real_provider_called"],
             false
@@ -759,6 +809,14 @@ mod tests {
         c.send_pending().unwrap();
         assert!(c.state["pending"].is_null());
         assert_eq!(c.state["verifications"][0]["state"], "accepted");
+        assert!(
+            c.state["inbox"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .take(3)
+                .all(|r| r["status"] == "accepted")
+        );
         c.verify_one().unwrap();
         assert_eq!(
             c.state["verifications"][0]["verification_cursor"],
@@ -788,7 +846,7 @@ mod tests {
         assert_eq!(c.state["verifications"][0]["state"], "verified");
         assert_eq!(c.state["cursor"], "server-cursor-165");
         assert_eq!(c.state["model_invocations"], 1);
-        save(&root.join("native-result.json"),&json!({"synthetic":true,"real_provider_called":false,"real_room_contacted":false,"receive_cursor":"server-cursor-165","verification_state":c.state["verifications"][0]["state"],"model_attempts":c.state["model_invocations"],"budget_used":c.state["model_budget"]["used"]})).unwrap();
+        save(&root.join("native-result.json"),&json!({"synthetic":true,"real_provider_called":false,"real_room_contacted":false,"batch_size":3,"receive_cursor":"server-cursor-165","verification_state":c.state["verifications"][0]["state"],"model_attempts":c.state["model_invocations"],"budget_used":c.state["model_budget"]["used"]})).unwrap();
         drop(c);
         fs::remove_dir_all(home).unwrap();
     }

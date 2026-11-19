@@ -44,11 +44,16 @@ fn id(seq: u64) -> String {
 }
 fn event(seq: u64) -> Value {
     let own = seq == 80;
-    let directed = seq == 1 || seq == 150;
-    json!({"schema":"tolight-event/1","seq":seq,"event_id":id(seq),"kind":"agent_message","created_at":"2000-01-01T00:00:00Z","retracted":false,"agent":{"agent_id":if own{"fixture-agent"}else if directed{"fixture-peer"}else{"fixture-noise"},"display_name":"Synthetic participant"},"text":if own{"answer"}else if directed{"A new unread question"}else{"Unrelated public traffic"},"reply_to":if own{json!({"event_id":id(1),"seq":1})}else{Value::Null},"mentions":if own{json!([{"agent_id":"fixture-peer","display_name":"Fixture Peer"}])}else if directed{json!([{"agent_id":"fixture-agent","display_name":"Fixture Agent"}])}else{json!([])},"from_self":own,"mentions_you":directed})
+    let directed = matches!(seq, 1..=3 | 150);
+    let author = match seq {
+        2 => "fixture-peer-two",
+        3 => "fixture-peer-three",
+        _ => "fixture-peer",
+    };
+    json!({"schema":"tolight-event/1","seq":seq,"event_id":id(seq),"kind":"agent_message","created_at":"2000-01-01T00:00:00Z","retracted":false,"agent":{"agent_id":if own{"fixture-agent"}else if directed{author}else{"fixture-noise"},"display_name":"Synthetic participant"},"text":if own{"answer"}else if directed{"A new unread question"}else{"Unrelated public traffic"},"reply_to":if own{json!({"event_id":id(3),"seq":3})}else{Value::Null},"mentions":if own{json!([{"agent_id":"fixture-peer"},{"agent_id":"fixture-peer-two"},{"agent_id":"fixture-peer-three"}])}else if directed{json!([{"agent_id":"fixture-agent","display_name":"Fixture Agent"}])}else{json!([])},"from_self":own,"mentions_you":directed})
 }
 fn self_value() -> Value {
-    json!({"spec_version":"tolight-participant/0.1","agent_id":"fixture-agent","display_name":"Fixture Agent","bio":"Synthetic identity only","state":"ACTIVE","timeline":"public","mute":null,"room_paused":false,"limits":{"max_text_scalars":2000}})
+    json!({"spec_version":"tolight-participant/0.1","agent_id":"fixture-agent","display_name":"Fixture Agent","bio":"Synthetic identity only","state":"ACTIVE","timeline":"public","mute":null,"room_paused":false,"limits":{"max_text_scalars":2000,"max_mentions_per_message":3}})
 }
 fn query<'a>(url: &'a str, key: &str) -> Option<&'a str> {
     url.split_once('?')?
@@ -145,7 +150,7 @@ fn serve(root: &Path, openssl: &str, port: u16, version: &str) -> Result<()> {
         } else if method == "GET" && endpoint.ends_with("/agents") {
             (
                 200,
-                json!({"timeline":"public","agents":[{"agent_id":"fixture-agent","display_name":"Fixture Agent"},{"agent_id":"fixture-peer","display_name":"Fixture Peer"},{"agent_id":"fixture-noise","display_name":"Fixture Noise"}]}),
+                json!({"timeline":"public","agents":[{"agent_id":"fixture-agent","display_name":"Fixture Agent","private_extension":"PRIVATE-ROSTER-FIELD"},{"agent_id":"fixture-peer","display_name":"Fixture Peer"},{"agent_id":"fixture-peer-two","display_name":"Fixture Peer Two"},{"agent_id":"fixture-peer-three","display_name":"Fixture Peer Three"},{"agent_id":"fixture-noise","display_name":"Fixture Noise"}]}),
             )
         } else if method == "GET" && endpoint.ends_with("/events") {
             let limit = query(&url, "limit").unwrap_or("50").parse::<u64>()?;
@@ -184,6 +189,15 @@ fn serve(root: &Path, openssl: &str, port: u16, version: &str) -> Result<()> {
                 || disk["pending"]["attempts"] != 1
                 || disk["model_budget"]["used"] != 1
                 || !disk["rust_generation"].is_null()
+                || disk["pending"]["trigger_ids"] != json!([id(1), id(2), id(3)])
+                || body_value["reply_to_event_id"] != id(3)
+                || body_value["mentions"] != json!(["fixture-peer", "fixture-peer-two"])
+                || disk["inbox"]
+                    .as_array()
+                    .ok_or("missing inbox")?
+                    .iter()
+                    .take(3)
+                    .any(|r| r["status"] != "draft")
             {
                 return Err("POST crossed an uncommitted state boundary".into());
             }
@@ -194,7 +208,7 @@ fn serve(root: &Path, openssl: &str, port: u16, version: &str) -> Result<()> {
             head = 200;
             note(
                 root,
-                json!({"observed":"post_after_durable_outbox_and_anchor","client_message_id":body_value["client_message_id"],"synthetic":true,"latest_window_excludes_accepted":true}),
+                json!({"observed":"post_after_durable_outbox_and_anchor","client_message_id":body_value["client_message_id"],"synthetic":true,"latest_window_excludes_accepted":true,"batch_size":3}),
             )?;
             (201, json!({"event_id":id(80),"seq":80}))
         } else {
@@ -237,7 +251,15 @@ fn synthetic_model(args: &[String]) -> Result<()> {
         serde_json::from_str(prompt.rsplit_once('\n').ok_or("model JSON missing")?.1)?;
     if !prompt.contains("native fixture role")
         || prompt.contains("你是全知")
+        || prompt.contains("PRIVATE-ROSTER-FIELD")
         || payload["identity"]["agent_id"] != "fixture-agent"
+        || payload["triggers"]
+            .as_array()
+            .ok_or("missing selected triggers")?
+            .iter()
+            .map(|e| e["event_id"].clone())
+            .collect::<Vec<_>>()
+            != vec![json!(id(1)), json!(id(2)), json!(id(3))]
     {
         return Err("role or GET-self identity not forwarded".into());
     }
@@ -247,12 +269,19 @@ fn synthetic_model(args: &[String]) -> Result<()> {
         || disk["model_budget"]["used"] != 1
         || disk["cursor"] != "server-cursor-15"
         || disk["inbox"][0]["status"] != "generating"
+        || disk["rust_generation"]["intent"]["trigger_ids"] != json!([id(1), id(2), id(3)])
+        || disk["inbox"].as_array().ok_or("missing inbox")?.len() != 3
+        || disk["inbox"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["status"] != "generating")
     {
         return Err("model started before receipt/cursor/budget/marker commit".into());
     }
     publish(
         &home.join("native-model-observed.json"),
-        &json!({"observed":"before_synthetic_model","generation_id":disk["rust_generation"]["generation_id"],"synthetic":true,"real_provider_called":false}),
+        &json!({"observed":"before_synthetic_model","generation_id":disk["rust_generation"]["generation_id"],"synthetic":true,"real_provider_called":false,"batch_size":3}),
     )?;
     println!("answer");
     Ok(())

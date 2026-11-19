@@ -49,7 +49,7 @@ pub(crate) fn status(home: &Path) -> Result<()> {
     };
     println!(
         "{}",
-        json!({"offline":true,"read_only":true,"normalized_view_only":true,"reported_process_unverified":process,"cursor_present":state["cursor"].is_string(),"timeline":state["timeline"],"pending":state["pending"].is_object(),"receipts_unresolved":inbox.iter().filter(|r|!journal::terminal_receipt(r["status"].as_str().unwrap_or(""))).count(),"generation":{"generation_id":state["rust_generation"]["generation_id"],"phase":state["rust_generation"]["phase"],"trigger_id":state["rust_generation"]["intent"]["trigger_id"].as_str().or(state["rust_generation"]["trigger_id"].as_str())},"verification_pending":state["verifications"].as_array().ok_or("verification journal missing")?.iter().filter(|j|j["state"]=="accepted").count(),"verification_states":verification_states,"verification_attention":verification_attention,"model_budget":budget,"model_attempts_total":state["model_invocations"],"owned_cleanup_unconfirmed":state["owned_cleanup_unconfirmed"]==true,"delivery_uncertainty":state["delivery_uncertainty"]==true})
+        json!({"offline":true,"read_only":true,"normalized_view_only":true,"build":crate::diagnostics::build_info(),"reported_process_unverified":process,"cursor_present":state["cursor"].is_string(),"timeline":state["timeline"],"pending":state["pending"].is_object(),"receipts_unresolved":inbox.iter().filter(|r|!journal::terminal_receipt(r["status"].as_str().unwrap_or(""))).count(),"generation":{"generation_id":state["rust_generation"]["generation_id"],"phase":state["rust_generation"]["phase"],"trigger_id":state["rust_generation"]["intent"]["trigger_id"].as_str().or(state["rust_generation"]["trigger_id"].as_str())},"verification_pending":state["verifications"].as_array().ok_or("verification journal missing")?.iter().filter(|j|j["state"]=="accepted").count(),"verification_states":verification_states,"verification_attention":verification_attention,"model_budget":budget,"model_attempts_total":state["model_invocations"],"owned_cleanup_unconfirmed":state["owned_cleanup_unconfirmed"]==true,"delivery_uncertainty":state["delivery_uncertainty"]==true})
     );
     Ok(())
 }
@@ -79,11 +79,20 @@ pub(crate) fn recover(
         "owned process cleanup is unconfirmed; inspect native processes before further operations; this command does not bypass that gate",
     )?;
     let imported = if let Some(path) = import_path {
-        require(
-            fs::metadata(path)?.len() <= 4 * 1024 * 1024,
-            "import result exceeds 4 MiB",
-        )?;
-        Some(load(path)?)
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        require(metadata.is_file(), "import result must be a regular file")?;
+        const LIMIT: u64 = 4 * 1024 * 1024;
+        require(metadata.len() <= LIMIT, "import result exceeds 4 MiB")?;
+        let mut raw = Vec::new();
+        Read::by_ref(&mut file)
+            .take(LIMIT + 1)
+            .read_to_end(&mut raw)?;
+        require(raw.len() as u64 <= LIMIT, "import result exceeds 4 MiB")?;
+        Some(serde_json::from_slice(&raw)?)
     } else {
         None
     };
@@ -149,7 +158,8 @@ pub(crate) fn speak(home: &Path, recipient: &str, topic: &str, request_id: &str)
     )?;
     let id = format!("owner-{}", sha(request_id.as_bytes()));
     require(
-        !contains(&client.state, "handled", &id)
+        !contains(&client.state, "outreach_request_ids", &id)
+            && !contains(&client.state, "handled", &id)
             && !journal::receipts(&client.state)?
                 .iter()
                 .any(|r| r["event_id"] == id),

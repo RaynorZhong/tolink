@@ -62,15 +62,17 @@ fn recipient_defaults(pending: &mut Value, context: &Value) {
 pub(crate) fn prepare(state: &mut Value) -> Result<()> {
     require(state.is_object(), "state must be an object")?;
     require(
-        state["rust_journal_version"].is_null() || state["rust_journal_version"] == 1,
+        state["rust_journal_version"].is_null()
+            || matches!(state["rust_journal_version"].as_u64(), Some(1 | 2)),
         "unsupported runtime journal",
     )?;
-    state["rust_journal_version"] = json!(1);
+    state["rust_journal_version"] = json!(2);
     for field in [
         "inbox",
         "verifications",
         "generation_history",
         "retracted_event_ids",
+        "outreach_request_ids",
     ] {
         if state[field].is_null() {
             state[field] = json!([]);
@@ -99,6 +101,29 @@ pub(crate) fn prepare(state: &mut Value) -> Result<()> {
     }
     let context = state["context"].clone();
     recipient_defaults(&mut state["pending"], &context);
+    // Recover every retained Owner request before bounded history can be pruned.
+    // Already-evicted pre-upgrade evidence cannot be reconstructed.
+    let mut owner_ids = BTreeSet::new();
+    let mut remember = |value: &Value| {
+        if let Some(id) = value.as_str().filter(|id| id.starts_with("owner-")) {
+            owner_ids.insert(id.to_owned());
+        }
+    };
+    for id in state["handled"].as_array().ok_or("handled missing")? {
+        remember(id);
+    }
+    for field in ["inbox", "verifications", "generation_history"] {
+        for record in state[field].as_array().ok_or("journal array missing")? {
+            remember(&record["event_id"]);
+            remember(&record["trigger_id"]);
+        }
+    }
+    remember(&state["pending"]["trigger_id"]);
+    remember(&state["rust_generation"]["trigger_id"]);
+    remember(&state["rust_generation"]["intent"]["trigger_id"]);
+    for id in owner_ids {
+        append_id(state, "outreach_request_ids", &id, None)?;
+    }
     if !state["pending"]["accepted"].is_null() {
         let pending = state["pending"].clone();
         let ack = pending["accepted"].clone();
@@ -119,8 +144,17 @@ pub(crate) fn receipt_mut<'a>(state: &'a mut Value, id: &str) -> Option<&'a mut 
 }
 pub(crate) fn add_receipt(state: &mut Value, receipt: Value) -> Result<()> {
     let id = string(&receipt, "event_id")?;
+    let outreach = receipt["kind"] == "outreach";
+    if outreach && contains(state, "outreach_request_ids", id) {
+        return Ok(());
+    }
     if contains(state, "handled", id) || receipts(state)?.iter().any(|r| r["event_id"] == id) {
         return Ok(());
+    }
+    // This index is committed with the receipt before any model/POST and never
+    // expires with terminal history. Ordinary retry uses the existing receipt.
+    if outreach {
+        append_id(state, "outreach_request_ids", id, None)?;
     }
     state["inbox"]
         .as_array_mut()
@@ -134,6 +168,68 @@ pub(crate) fn decision(state: &mut Value, id: &str, status: &str, reason: &str) 
         receipt["reason"] = json!(reason);
     }
     append_id(state, "handled", id, Some(512))?;
+    Ok(())
+}
+pub(crate) fn work_ids(work: &Value) -> Result<Vec<String>> {
+    let primary = string(work, "trigger_id")?;
+    let ids = if work["trigger_ids"].is_null() {
+        vec![primary.to_owned()]
+    } else {
+        work["trigger_ids"]
+            .as_array()
+            .ok_or("invalid trigger set")?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "invalid trigger ID".into())
+            })
+            .collect::<Result<Vec<String>>>()?
+    };
+    require(
+        !ids.is_empty()
+            && ids.len() <= 3
+            && ids.iter().any(|id| id == primary)
+            && ids.iter().collect::<BTreeSet<_>>().len() == ids.len(),
+        "invalid trigger set",
+    )?;
+    Ok(ids)
+}
+pub(crate) fn decide_work(
+    state: &mut Value,
+    work: &Value,
+    status: &str,
+    reason: &str,
+) -> Result<()> {
+    for id in work_ids(work)? {
+        decision(state, &id, status, reason)?;
+    }
+    Ok(())
+}
+fn recoverable_work(state: &Value, generation: &Value) -> Result<()> {
+    require(
+        !generation["phase"]
+            .as_str()
+            .is_some_and(|p| p.starts_with("blocked_")),
+        "blocked generation cannot be resumed",
+    )?;
+    let intent = &generation["intent"];
+    if intent["kind"] == "diagnostic" {
+        return Ok(());
+    }
+    for id in work_ids(intent)? {
+        let r = receipts(state)?
+            .iter()
+            .find(|r| r["event_id"] == id)
+            .ok_or("generation receipt missing")?;
+        require(
+            matches!(
+                r["status"].as_str(),
+                Some("received" | "generating" | "generation_unknown")
+            ) && !contains(state, "retracted_event_ids", &id),
+            "terminal or retracted/reset trigger cannot be resumed",
+        )?;
+    }
     Ok(())
 }
 pub(crate) fn terminal_receipt(status: &str) -> bool {
@@ -244,10 +340,11 @@ pub(crate) fn reserve(
         generation["generation_id"].is_string() && generation["intent"].is_object(),
         "invalid generation intent",
     )?;
+    let ids = work_ids(&generation["intent"])?;
     state["model_budget"]["used"] = json!(used);
     state["model_invocations"] = json!(total);
-    if let Some(id) = generation["intent"]["trigger_id"].as_str() {
-        if let Some(r) = receipt_mut(state, id) {
+    for id in ids {
+        if let Some(r) = receipt_mut(state, &id) {
             r["status"] = json!("generating");
         }
     }
@@ -294,6 +391,7 @@ pub(crate) fn complete_generation(
     let generation = state["rust_generation"].clone();
     require(generation.is_object(), "no generation to complete")?;
     let intent = &generation["intent"];
+    recoverable_work(state, &generation)?;
     if let Some(trigger) = intent["trigger_id"].as_str() {
         require(
             !contains(state, "retracted_event_ids", trigger),
@@ -303,16 +401,16 @@ pub(crate) fn complete_generation(
     validate_result(intent, reply)?;
     let id = string(intent, "trigger_id")?.to_owned();
     if intent["kind"] == "diagnostic" {
-        decision(
+        decide_work(
             state,
-            &id,
+            intent,
             "diagnostic_complete",
             "nonpublished_model_check",
         )?;
     } else if reply.is_empty() || reply == "[SILENT]" {
-        decision(
+        decide_work(
             state,
-            &id,
+            intent,
             "silent",
             if reply.is_empty() {
                 "empty_model_result"
@@ -330,14 +428,20 @@ pub(crate) fn complete_generation(
             body["mentions"] = json!([intent["recipient_id"]]);
         } else {
             body["reply_to_event_id"] = intent["reply_to_event_id"].clone();
+            body["mentions"] = intent["reply_mentions"]
+                .as_array()
+                .cloned()
+                .map_or(json!([]), |ids| json!(ids));
         }
-        state["pending"] = json!({"timeline":intent["timeline"],"trigger_id":id,"body":body,"allowed_mentions":intent["allowed_mentions"],"required_recipient":intent["recipient_id"],"generation_id":generation["generation_id"],"attempts":0,"verification_cursor":null});
-        if let Some(r) = receipt_mut(state, &id) {
-            r["status"] = json!("draft");
-            r["reason"] = json!("model_result_persisted");
+        state["pending"] = json!({"timeline":intent["timeline"],"trigger_id":id,"trigger_ids":work_ids(intent)?,"body":body,"allowed_mentions":intent["allowed_mentions"],"required_recipient":intent["recipient_id"],"generation_id":generation["generation_id"],"attempts":0,"verification_cursor":null});
+        for selected in work_ids(intent)? {
+            if let Some(r) = receipt_mut(state, &selected) {
+                r["status"] = json!("draft");
+                r["reason"] = json!("model_result_persisted");
+            }
         }
     }
-    let history = json!({"generation_id":generation["generation_id"],"trigger_id":id,"at":at,"outcome":if intent["kind"] == "diagnostic" {"diagnostic_complete"} else if reply.is_empty() || reply == "[SILENT]" {"silent"} else {"draft"},"provenance":provenance,"result_sha256":sha(reply.as_bytes())});
+    let history = json!({"generation_id":generation["generation_id"],"trigger_id":id,"trigger_ids":work_ids(intent)?,"at":at,"outcome":if intent["kind"] == "diagnostic" {"diagnostic_complete"} else if reply.is_empty() || reply == "[SILENT]" {"silent"} else {"draft"},"provenance":provenance,"result_sha256":sha(reply.as_bytes())});
     state["generation_history"]
         .as_array_mut()
         .ok_or("missing generation history")?
@@ -379,9 +483,14 @@ pub(crate) fn recover(
             )?;
         }
         "discard" => {
-            decision(
+            let work = if generation["intent"].is_object() {
+                &generation["intent"]
+            } else {
+                &generation
+            };
+            decide_work(
                 state,
-                &trigger,
+                work,
                 "discarded",
                 "owner_discarded_unknown_generation",
             )?;
@@ -396,16 +505,12 @@ pub(crate) fn recover(
                 generation["intent"]["kind"] != "diagnostic",
                 "discard diagnostic uncertainty, then explicitly run model-check",
             )?;
-            let receipt = receipt_mut(state, &trigger).ok_or("receipt missing")?;
-            require(
-                matches!(
-                    receipt["status"].as_str(),
-                    Some("received" | "generating" | "generation_unknown")
-                ),
-                "terminal or retracted/reset trigger cannot be retried",
-            )?;
-            receipt["status"] = json!("received");
-            receipt["reason"] = json!("owner_confirmed_new_billable_attempt");
+            recoverable_work(state, &generation)?;
+            for selected in work_ids(&generation["intent"])? {
+                let receipt = receipt_mut(state, &selected).ok_or("receipt missing")?;
+                receipt["status"] = json!("received");
+                receipt["reason"] = json!("owner_confirmed_new_billable_attempt");
+            }
             state["rust_generation"] = Value::Null;
         }
         _ => return Err("unknown recovery action".into()),
@@ -462,9 +567,9 @@ pub(crate) fn accept(state: &mut Value, ack: &Value, at: &str) -> Result<()> {
         .as_array_mut()
         .ok_or("missing verification journal")?
         .push(pending);
-    decision(
+    decide_work(
         state,
-        &trigger,
+        &state["pending"].clone(),
         "accepted",
         "server_accepted_independent_verification_pending",
     )?;
@@ -521,6 +626,16 @@ pub(crate) fn verify_page(job: &mut Value, page: &Value, our_id: &str, at: &str)
             .iter()
             .map(|v| string(v, "agent_id").map(str::to_owned))
             .collect::<Result<_>>()?;
+        let explicit: BTreeSet<String> = job["body"]["mentions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "invalid explicit recipient".into())
+            })
+            .collect::<Result<_>>()?;
         let required = job["required_recipient"].as_str();
         let expected = job["body"]["text"]
             .as_str()
@@ -531,6 +646,7 @@ pub(crate) fn verify_page(job: &mut Value, page: &Value, our_id: &str, at: &str)
         let cleared = !expected_parent.is_null() && actual_parent.is_null();
         if event["text"].as_str() != Some(expected.as_str())
             || (!cleared && actual_parent != expected_parent)
+            || !explicit.is_subset(&actual)
             || !addressing::validate_readback(&actual, &allowed(job)?, required)
         {
             job["state"] = json!("mismatch");
@@ -581,6 +697,11 @@ mod tests {
             let mut g = generation("reply");
             g["generation_id"] = json!(format!("fixture-generation-{index}"));
             g["intent"]["trigger_id"] = json!(format!("fixture-trigger-{index}"));
+            add_receipt(
+                &mut s,
+                json!({"event_id":g["intent"]["trigger_id"],"status":"received"}),
+            )
+            .unwrap();
             reserve(&mut s, &cfg, "2026-11-18", g).unwrap();
             complete_generation(&mut s, "[SILENT]", "unused", "fixture-now", "synthetic").unwrap();
         }
@@ -593,6 +714,11 @@ mod tests {
     fn state() -> Value {
         let mut s = json!({"context":[],"handled":[],"own_event_ids":[],"pending":null,"model_invocations":0});
         prepare(&mut s).unwrap();
+        add_receipt(
+            &mut s,
+            json!({"event_id":"question","status":"received","timeline":"public","kind":"reply"}),
+        )
+        .unwrap();
         s
     }
     fn intent(kind: &str) -> Value {
@@ -614,7 +740,8 @@ mod tests {
         reserve(&mut s, &cfg, "2026-11-18", generation("reply")).unwrap();
         assert_eq!(s["model_budget"]["used"], 1);
         complete_generation(&mut s, "[SILENT]", "unused", "now", "native").unwrap();
-        assert_eq!(s["inbox"].as_array().unwrap().len(), 0);
+        assert_eq!(s["inbox"][0]["status"], "silent");
+        s["inbox"][0]["status"] = json!("received"); // Synthetic new-attempt budget control.
         reserve(&mut s, &cfg, "2026-11-18", generation("reply")).unwrap();
         s["rust_generation"]["phase"] = json!("unknown");
         recover(&mut s, "generation-one", "discard", None, "now", "unused").unwrap();

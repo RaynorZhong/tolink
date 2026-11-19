@@ -1,4 +1,5 @@
 mod addressing;
+mod diagnostics;
 mod journal;
 mod process;
 mod runtime;
@@ -346,6 +347,33 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>()
         .as_slice()
     {
+        ["--version"] => {
+            let info = diagnostics::build_info();
+            println!(
+                "tolink {} (revision {}; {}/{})",
+                info["version"].as_str().unwrap(),
+                info["source_revision"].as_str().unwrap(),
+                info["os"].as_str().unwrap(),
+                info["arch"].as_str().unwrap()
+            );
+            Ok(())
+        }
+        ["validate", file] => {
+            let report = diagnostics::validate_path(Path::new(file))?;
+            println!("{report}");
+            require(
+                report["valid"] == true,
+                "invalid configuration; see sanitized report",
+            )
+        }
+        ["doctor", home] => {
+            let report = diagnostics::doctor(Path::new(home))?;
+            println!("{report}");
+            require(
+                report["attention_required"] == false,
+                "offline diagnosis requires attention; runtime was not verified",
+            )
+        }
         ["vectors", file] => vectors(Path::new(file)),
         ["run", home] => runtime::run(Path::new(home)),
         ["self", home] => runtime::fresh_self(Path::new(home)),
@@ -381,7 +409,7 @@ fn main() -> Result<()> {
 
         _ => {
             eprintln!(
-                "tolink run STATE_DIRECTORY\ntolink self STATE_DIRECTORY\ntolink status STATE_DIRECTORY\ntolink inspect STATE_DIRECTORY\ntolink recover STATE_DIRECTORY GENERATION_ID discard|retry --confirm GENERATION_ID\ntolink recover STATE_DIRECTORY GENERATION_ID import RESULT_JSON --confirm GENERATION_ID\ntolink speak STATE_DIRECTORY RECIPIENT TOPIC OWNER_REQUEST_ID\ntolink model-check STATE_DIRECTORY\ntolink vectors FILE\ntolink probe HTTPS_BASE CA [CURL_EXECUTABLE]\nstatus/inspect are offline and read-only. recover requires the writer stopped and exact ID confirmation. run is a foreground worker. model-check shares the finite daily budget and does not publish. self uses the worker's single request lane. speak requires a normal stop first. No registration, scheduler or boot-service commands."
+                "tolink --version\ntolink validate CONFIG_JSON\ntolink doctor STATE_DIRECTORY\ntolink run STATE_DIRECTORY\ntolink self STATE_DIRECTORY\ntolink status STATE_DIRECTORY\ntolink inspect STATE_DIRECTORY\ntolink recover STATE_DIRECTORY GENERATION_ID discard|retry --confirm GENERATION_ID\ntolink recover STATE_DIRECTORY GENERATION_ID import RESULT_JSON --confirm GENERATION_ID\ntolink speak STATE_DIRECTORY RECIPIENT TOPIC OWNER_REQUEST_ID\ntolink model-check STATE_DIRECTORY\ntolink vectors FILE\ntolink probe HTTPS_BASE CA [CURL_EXECUTABLE]\nvalidate/doctor/status/inspect are offline and read-only. validate checks structure only. doctor reports metadata, not verified runtime health. recover requires the writer stopped and exact ID confirmation. run is a foreground worker. model-check shares the finite daily budget and does not publish. self uses the worker's single request lane. speak requires a normal stop first. No registration, scheduler or boot-service commands."
             );
             Err("invalid command".into())
         }
