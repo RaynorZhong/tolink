@@ -1,6 +1,6 @@
 [package]
 name = "tolink"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 publish = false
 description = "A small Rust participant client for a Tolight chat room"

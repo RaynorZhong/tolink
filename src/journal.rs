@@ -2,6 +2,77 @@
 use crate::{Result, Value, addressing, json, require, sha};
 use std::collections::BTreeSet;
 
+pub(crate) const VERSION: u64 = 3;
+const OPTIONAL_ARRAYS: &[&str] = &[
+    "inbox",
+    "verifications",
+    "generation_history",
+    "retracted_event_ids",
+    "outreach_request_ids",
+];
+
+/// Pure, redacted format checks shared by runtime admission and offline doctor.
+pub(crate) fn validate_format(state: &Value) -> Result<()> {
+    require(state.is_object(), "state must be an object")?;
+    require(
+        state["rust_journal_version"].is_null()
+            || state["rust_journal_version"]
+                .as_u64()
+                .is_some_and(|v| (1..=VERSION).contains(&v)),
+        "unsupported runtime journal",
+    )?;
+    for field in ["context", "handled", "own_event_ids"] {
+        require(state[field].is_array(), &format!("{field}: expected array"))?;
+    }
+    for &field in OPTIONAL_ARRAYS {
+        require(
+            state[field].is_null() || state[field].is_array(),
+            &format!("{field}: expected array when present"),
+        )?;
+    }
+    for field in ["pending", "rust_generation"] {
+        require(
+            state[field].is_null() || state[field].is_object(),
+            &format!("{field}: expected object or null"),
+        )?;
+    }
+    for field in ["self_refresh_required"] {
+        require(
+            state[field].is_null() || state[field].is_boolean(),
+            "invalid self refresh marker",
+        )?;
+    }
+    if !state["pending"]["accepted"].is_null() {
+        validate_ack(&state["pending"]["accepted"])?;
+    }
+    if let Some(receipts) = state["inbox"].as_array() {
+        for receipt in receipts {
+            let work = &receipt["retry_work"];
+            if !work.is_null() {
+                require(
+                    work.is_object() && work["timeline"].is_string(),
+                    "invalid saved retry group",
+                )?;
+                let ids = work_ids(work)?;
+                require(
+                    receipt["event_id"]
+                        .as_str()
+                        .is_some_and(|id| ids.iter().any(|v| v == id)),
+                    "retry group does not contain its receipt",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+fn validate_ack(ack: &Value) -> Result<()> {
+    string(ack, "event_id")?;
+    require(
+        ack["seq"].as_u64().is_some_and(|n| n > 0),
+        "invalid accepted sequence",
+    )
+}
+
 pub(crate) fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key]
         .as_str()
@@ -60,36 +131,13 @@ fn recipient_defaults(pending: &mut Value, context: &Value) {
     };
 }
 pub(crate) fn prepare(state: &mut Value) -> Result<()> {
-    require(state.is_object(), "state must be an object")?;
-    require(
-        state["rust_journal_version"].is_null()
-            || matches!(state["rust_journal_version"].as_u64(), Some(1 | 2)),
-        "unsupported runtime journal",
-    )?;
-    state["rust_journal_version"] = json!(2);
-    for field in [
-        "inbox",
-        "verifications",
-        "generation_history",
-        "retracted_event_ids",
-        "outreach_request_ids",
-    ] {
+    validate_format(state)?;
+    state["rust_journal_version"] = json!(VERSION);
+    for &field in OPTIONAL_ARRAYS {
         if state[field].is_null() {
             state[field] = json!([]);
         }
-        require(state[field].is_array(), "invalid runtime journal array")?;
     }
-    for field in ["context", "handled", "own_event_ids"] {
-        require(state[field].is_array(), "invalid existing state array")?;
-    }
-    require(
-        state["pending"].is_null() || state["pending"].is_object(),
-        "invalid pending outbox",
-    )?;
-    require(
-        state["rust_generation"].is_null() || state["rust_generation"].is_object(),
-        "invalid generation marker",
-    )?;
     if !state["rust_generation"].is_null() && state["rust_generation"]["generation_id"].is_null() {
         let id = format!(
             "legacy-{}",
@@ -346,6 +394,9 @@ pub(crate) fn reserve(
     for id in ids {
         if let Some(r) = receipt_mut(state, &id) {
             r["status"] = json!("generating");
+            r.as_object_mut()
+                .ok_or("invalid receipt")?
+                .remove("retry_work");
         }
     }
     state["rust_generation"] = generation;
@@ -506,10 +557,18 @@ pub(crate) fn recover(
                 "discard diagnostic uncertainty, then explicitly run model-check",
             )?;
             recoverable_work(state, &generation)?;
-            for selected in work_ids(&generation["intent"])? {
+            let ids = work_ids(&generation["intent"])?;
+            let source_cursor = receipts(state)?
+                .iter()
+                .find(|r| r["event_id"] == trigger)
+                .ok_or("receipt missing")?["source_cursor"]
+                .clone();
+            let work = json!({"trigger_id":trigger,"trigger_ids":ids,"timeline":generation["intent"]["timeline"],"source_cursor":source_cursor,"retry_of":id});
+            for selected in work_ids(&work)? {
                 let receipt = receipt_mut(state, &selected).ok_or("receipt missing")?;
                 receipt["status"] = json!("received");
                 receipt["reason"] = json!("owner_confirmed_new_billable_attempt");
+                receipt["retry_work"] = work.clone();
             }
             state["rust_generation"] = Value::Null;
         }
@@ -522,6 +581,7 @@ pub(crate) fn recover(
 pub(crate) fn accept(state: &mut Value, ack: &Value, at: &str) -> Result<()> {
     let mut pending = state["pending"].clone();
     require(pending.is_object(), "no pending message")?;
+    validate_ack(ack)?;
     let event_id = string(ack, "event_id")?;
     require(
         ack["seq"].as_u64().is_some_and(|n| n > 0),

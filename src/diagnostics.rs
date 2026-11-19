@@ -267,20 +267,8 @@ fn journal_view(
     let Some(state) = state else {
         return json!({"available":false,"blockers":["state_unavailable"],"summary_only":true});
     };
-    for field in ["context", "handled", "own_event_ids"] {
-        if !state[field].is_array() {
-            errors.push(format!("state.json:{field}: expected array"));
-        }
-    }
-    for field in [
-        "inbox",
-        "verifications",
-        "generation_history",
-        "retracted_event_ids",
-    ] {
-        if !state[field].is_null() && !state[field].is_array() {
-            errors.push(format!("state.json:{field}: expected array when present"));
-        }
+    if let Err(error) = crate::journal::validate_format(state) {
+        errors.push(format!("state.json: {error}"));
     }
     for field in ["pending", "rust_generation", "model_budget"] {
         if !state[field].is_null() && !state[field].is_object() {
@@ -299,11 +287,14 @@ fn journal_view(
     if !state["rust_journal_version"].is_null() && version.is_none() {
         errors.push("state.json:rust_journal_version: expected nonnegative integer".into());
     }
-    if version.is_some_and(|v| v > 2) {
+    if version.is_some_and(|v| v > crate::journal::VERSION) {
         warnings
             .push("journal: newer version; reporting known fields only, without upgrading".into());
     }
     let mut blockers = Vec::new();
+    if state["self_refresh_required"] == true {
+        blockers.push("self_refresh_required");
+    }
     let pending = !state["pending"].is_null();
     let generation = !state["rust_generation"].is_null();
     if pending {
@@ -1061,6 +1052,36 @@ mod tests {
         let report = doctor(&f.0).unwrap();
         for reason in ["request_backoff", "public_send_pacing"] {
             assert!(strings_contain(&report["journal"]["blockers"], reason));
+        }
+    }
+
+    #[test]
+    fn patch_doctor_rejects_the_same_journal_formats_as_runtime() {
+        let f = Fixture::populated();
+        let mut config: Value =
+            serde_json::from_slice(&fs::read(f.0.join("config.json")).unwrap()).unwrap();
+        config["owner_authorization"]["allow_public_replies"] = json!(true);
+        f.json("config.json", &config);
+        assert_eq!(doctor(&f.0).unwrap()["attention_required"], false);
+        let original: Value =
+            serde_json::from_slice(&fs::read(f.0.join("state.json")).unwrap()).unwrap();
+        for issue in ["zero_version", "bad_outreach_index"] {
+            let mut state = original.clone();
+            if issue == "zero_version" {
+                state["rust_journal_version"] = json!(0);
+            } else {
+                state["outreach_request_ids"] = json!("not-an-array");
+            }
+            assert!(crate::journal::prepare(&mut state.clone()).is_err());
+            f.json("state.json", &state);
+            let before = fs::read(f.0.join("state.json")).unwrap();
+            let report = doctor(&f.0).unwrap();
+            assert!(
+                !report["errors"].as_array().unwrap().is_empty(),
+                "doctor falsely accepted {issue}"
+            );
+            assert_eq!(report["attention_required"], true);
+            assert_eq!(before, fs::read(f.0.join("state.json")).unwrap());
         }
     }
 

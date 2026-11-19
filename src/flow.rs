@@ -181,6 +181,7 @@ impl Client {
             &json!({"checked_at":utc()?,"request_id":request_id,"http_status":status,"self":value}),
         )?;
         self.state["self"] = value.clone();
+        self.state["self_refresh_required"] = json!(false);
         self.state["self_checked_epoch"] = json!(now());
         self.discard_ineligible(&value)?;
         self.save()?;
@@ -525,11 +526,20 @@ impl Client {
             }
         }
         let current = self.state["self"].clone();
-        self.discard_ineligible(&current)?;
+        if current.is_object() && current["timeline"] != timeline {
+            // The page contradicts the cache. Preserve work even if fresh self is deferred.
+            self.state["self_refresh_required"] = json!(true);
+        }
+        if self.state["self_refresh_required"] != true {
+            self.discard_ineligible(&current)?;
+        }
         // One save commits ALL new receipts and the page's consumption cursor before a model call.
         self.state["cursor"] = json!(cursor);
         journal::prune(&mut self.state)?;
         self.save()?;
+        if self.state["self_refresh_required"] == true {
+            self.refresh_self()?;
+        }
         if !events.is_empty() {
             self.log(
                 "page",
@@ -539,6 +549,18 @@ impl Client {
         Ok(())
     }
     fn select_receipts(&self, first: &Value, current: &Value) -> Result<Vec<Value>> {
+        if first["retry_work"].is_object() {
+            return journal::work_ids(&first["retry_work"])?
+                .iter()
+                .map(|id| {
+                    journal::receipts(&self.state)?
+                        .iter()
+                        .find(|r| r["event_id"] == *id)
+                        .cloned()
+                        .ok_or_else(|| "saved retry member missing".into())
+                })
+                .collect();
+        }
         let limit = match self.config.get("reply_batch_max") {
             None => 3,
             Some(v) => v
@@ -567,6 +589,7 @@ impl Client {
                 break;
             }
             if receipt["event_id"] == first["event_id"]
+                || !receipt["retry_work"].is_null()
                 || receipt["status"] != "received"
                 || receipt["kind"] != "reply"
                 || receipt["timeline"] != first["timeline"]
@@ -593,8 +616,76 @@ impl Client {
         if !self.state["rust_generation"].is_null() || !self.state["pending"].is_null() {
             return Ok(());
         }
+        if !valid_outreach(receipt) {
+            journal::decision(
+                &mut self.state,
+                text(receipt, "event_id")?,
+                "discarded",
+                "invalid_owner_topic",
+            )?;
+            self.save()?;
+            return Ok(());
+        }
+        let retry = &receipt["retry_work"];
+        if retry.is_object() {
+            let ids = journal::work_ids(retry)?;
+            let members: Vec<&Value> = journal::receipts(&self.state)?
+                .iter()
+                .filter(|r| {
+                    r["event_id"]
+                        .as_str()
+                        .is_some_and(|id| ids.iter().any(|v| v == id))
+                })
+                .collect();
+            let authors: std::collections::BTreeSet<&str> = members
+                .iter()
+                .filter_map(|r| r["event"]["agent"]["agent_id"].as_str())
+                .collect();
+            let max_people = current["limits"]["max_mentions_per_message"]
+                .as_u64()
+                .unwrap_or(1);
+            let valid = members.len() == ids.len()
+                && authors.len() as u64 <= max_people
+                && members.iter().all(|r| {
+                    r["status"] == "received"
+                        && r["retry_work"] == *retry
+                        && r["timeline"] == retry["timeline"]
+                        && r["source_cursor"] == retry["source_cursor"]
+                        && valid_outreach(r)
+                        && !contains(
+                            &self.state,
+                            "retracted_event_ids",
+                            r["event_id"].as_str().unwrap_or(""),
+                        )
+                });
+            if !valid {
+                for id in ids {
+                    let live = journal::receipts(&self.state)?.iter().any(|r| {
+                        r["event_id"] == id
+                            && !journal::terminal_receipt(r["status"].as_str().unwrap_or(""))
+                    });
+                    if live {
+                        journal::decision(
+                            &mut self.state,
+                            &id,
+                            "discarded",
+                            "retry_group_no_longer_eligible",
+                        )?;
+                    }
+                }
+                self.save()?;
+                return Ok(());
+            }
+        }
         let selected = self.select_receipts(receipt, current)?;
-        let receipt = selected.last().ok_or("empty selected work")?;
+        let receipt = if retry.is_object() {
+            selected
+                .iter()
+                .find(|r| r["event_id"] == retry["trigger_id"])
+                .ok_or("saved retry primary missing")?
+        } else {
+            selected.last().ok_or("empty selected work")?
+        };
         let work = json!({"trigger_id":receipt["event_id"],"trigger_ids":selected.iter().map(|r|r["event_id"].clone()).collect::<Vec<_>>()});
         let receipt_id = text(receipt, "event_id")?;
         if contains(&self.state, "retracted_event_ids", receipt_id)
@@ -639,6 +730,7 @@ impl Client {
             self.save()?;
             return Ok(());
         }
+        model_executable(&self.config)?;
         let Some((status, agents)) = self.call("agents", "", None)? else {
             return Ok(());
         };
@@ -794,6 +886,17 @@ impl Client {
         if !self.state["pending"].is_null() || !self.state["rust_generation"].is_null() {
             return Ok(());
         }
+        let invalid: Vec<String> = journal::receipts(&self.state)?
+            .iter()
+            .filter(|r| r["status"] == "received" && !valid_outreach(r))
+            .filter_map(|r| r["event_id"].as_str().map(str::to_owned))
+            .collect();
+        if !invalid.is_empty() {
+            for id in invalid {
+                journal::decision(&mut self.state, &id, "discarded", "invalid_owner_topic")?;
+            }
+            self.save()?;
+        }
         let receipt = journal::receipts(&self.state)?
             .iter()
             .find(|r| r["status"] == "received")
@@ -854,6 +957,7 @@ impl Client {
                 Value::Null
             };
             if self.state["self"].is_null()
+                || self.state["self_refresh_required"] == true
                 || now() - number(&self.state, "self_checked_epoch") >= 60.0
                 || request_id != snapshot["request_id"]
             {

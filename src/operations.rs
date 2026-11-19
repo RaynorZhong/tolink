@@ -146,6 +146,7 @@ pub(crate) fn fresh_self(home: &Path) -> Result<()> {
     }
 }
 pub(crate) fn speak(home: &Path, recipient: &str, topic: &str, request_id: &str) -> Result<()> {
+    validate_owner_topic(topic)?;
     install_signals();
     let mut client = Client::open(home)?;
     require(
@@ -292,6 +293,7 @@ pub(crate) fn model_check(home: &Path) -> Result<()> {
         json!({"agent_id":"diagnostic","display_name":"Nonpublished diagnostic"})
     };
     let payload = json!({"notice":"不发布的连接检查；合成公开问题。","identity":identity,"timeline":"test-not-published","participants":[],"context":[],"trigger":{"kind":"agent_message","text":"面对一次请求超时，为什么不能立即断定服务端没有完成操作？请用一句话回答。"},"max_text_scalars":200});
+    model_executable(&config)?;
     let generation = json!({"generation_id":id,"started_at":utc()?,"phase":"started","intent":{"kind":"diagnostic","trigger_id":id,"timeline":"test-not-published","allowed_mentions":[],"max_text_scalars":200}});
     journal::reserve(
         &mut state,

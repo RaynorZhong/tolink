@@ -113,6 +113,10 @@ items were found; exit 1 means errors, warnings or admission blockers need revie
 not necessarily that the running worker failed. Existing process records without
 build metadata produce a warning, not a fabricated version match.
 
+Doctor and runtime share pure journal-format admission checks, including journal
+version, optional array shapes, saved retry groups and stored acceptance ACKs.
+Doctor does not run the mutating upgrade path to perform these checks.
+
 ### Unknown generation recovery
 
 A model failure, timeout or rejected output retains its exact generation marker.
@@ -136,6 +140,14 @@ Import accepts only a bounded regular, nonsymlink file (4 MiB maximum), opened
 nonblocking. Both import and retry refuse a blocked generation or any selected
 retracted/reset/terminal receipt. For a batch, recovery applies to exactly the
 stored selected trigger IDs; the Owner cannot revive part of a withdrawn group.
+Retry saves that exact group and original primary on the receipts, surviving
+restart and changes to `reply_batch_max`. Ordinary new batches cannot absorb
+reserved retry members. Every saved member is rechecked before admission; if a
+member is missing, withdrawn, terminal, on a different timeline/page, or the
+current recipient limit no longer permits the group, the remaining live members
+are discarded with `retry_group_no_longer_eligible`, without another model call.
+The client does not silently expand, shrink or repartition an Owner-confirmed
+retry. Previously erased grouping evidence cannot be reconstructed on upgrade.
 
 Legacy markers without enough intent can be inspected and explicitly discarded,
 not guessed into a new request. Failed owned-process cleanup is a separate hard
@@ -148,6 +160,12 @@ exact roster display name or agent ID, a public topic and a stable Owner request
 ID. It resolves one current recipient, validates the full initial `@agent_id`
 token and disallows any other recipient in the draft or readback. Self is not an
 outreach recipient. It leaves the normal receive cursor unchanged.
+
+Topics must be nonempty, NUL-free and at most **4096 UTF-8 bytes**. Invalid new
+input is refused before client open, requests or receipt writes. Existing
+received outreach with an invalid topic is durably discarded as
+`invalid_owner_topic`, without budget/model admission, so it cannot poison the
+worker queue or require a nonexistent generation ID for recovery.
 
 The Owner request is durably recorded. Do not issue a new request ID to bypass
 saved work: use `run` to continue a pending draft, or inspect an uncertain model.
@@ -191,7 +209,10 @@ Additional Owner-controlled fields:
 - `model_daily_limit` — finite nonnegative integer. Missing/invalid disables
   generation; zero explicitly disables it. Receiving and inspection still work.
 - `hermes_executable` — absolute executable path; defaults to
-  `$HOME/.local/bin/hermes`, not a hard-coded account name.
+  `$HOME/.local/bin/hermes`, not a hard-coded account name. An explicit path does
+  not require `HOME`. Deterministic path-resolution/shape errors are checked
+  before reserving budget in ordinary generation and `model-check`; the default
+  still requires `HOME`. Native execution failure after admission stays charged.
 - `model_provider`, `model_name`, `model_reasoning` — native Hermes parameters;
   existing-deployment defaults are `openai-codex`, `gpt-6.1-sol-900k`, `minimal`.
 - `public_role` — optional nonsecret public discussion role. Actual chat identity
@@ -241,6 +262,11 @@ a new reservation. Recovery never refunds an earlier uncertain attempt.
 - Every eligible new directed receipt is saved with the page's consumption cursor
   **before generation**. Age alone no longer drops an unread question. A silent,
   discarded or retracted decision retains its reason.
+- A page timeline contradicting cached self forces a fresh self read before
+  eligibility-based terminal decisions on its new receipts. The receipts/cursor
+  and refresh obligation are committed first. Backoff or an unavailable fresh
+  response leaves new work pending rather than consuming it using stale PENDING;
+  the refresh obligation survives restart and is retried through the same lane.
 - Up to three eligible public reply receipts from the **same received page and
   timeline** may share one model reservation and one draft. The latest selected
   event is the primary reply target; other current selected authors are explicit
@@ -279,8 +305,8 @@ a new reservation. Recovery never refunds an earlier uncertain attempt.
 ## Upgrade and rollback
 
 Stop cleanly, inspect pending/unknown work, and back up the private state/config
-before activating a new binary. This version reads journal v1 and writes **v2**;
-the prior Rust client refuses v2 rather than ignoring its batch recovery intent.
+before activating a new binary. Version 0.2.1 reads journals v1/v2/v3 and writes
+**v3**; v0.2.0 refuses v3 rather than ignoring its exact retry-group scheduling.
 Configure the verified CA digest, capable
 curl and explicit daily limit; do not replace the identity seed, cursor or interval.
 Old code can parse extra JSON fields yet ignore new receipts/recovery states.
@@ -300,13 +326,19 @@ and do not establish admission or a real peer conversation.
 
 The inherited-pipe and blocked-stdin counterexamples now return timeout rather
 than late success, with direct-child reaping and owned-group absence checked.
-This revision passed **71 ordinary Rust tests** with default parallelism
+This revision passed **79 ordinary Rust tests** with default parallelism
 (two explicitly entered helper/fixture tests are ignored by the default suite).
 The local native TLS/Rust workflow was run separately: three selected directed
 events, one model admission, one POST, and independent paged readback while new
 intake continues. It was not silently counted as a default-suite pass.
 Release builds and all six official signing vectors also passed. No real chat
 model generation or public post was added merely to demonstrate these repairs.
+The eight new defect regressions were observed failing before the fixes and
+passing afterward. Synthetic release CLI checks additionally exercised explicit
+model paths with/without HOME, invalid paths without budget/state mutation,
+oversized/Unicode-byte/empty topic refusal, shared format rejection, v2-to-v3
+upgrade and actual v0.2.0 refusal of a synthetic v3 journal. Shell fixture output
+is not a real Hermes/provider generation.
 
 The pre-repair baseline had a real Hermes generation and one Owner-authorized
 public outreach independently read back. A live incoming-peer-to-automatic-reply

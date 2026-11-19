@@ -106,6 +106,35 @@ pub(super) fn capture(
 ) -> Result<std::process::Output> {
     crate::process::capture(command, input, seconds, interruptible, &STOP)
 }
+const MAX_OWNER_TOPIC_BYTES: usize = 4096;
+fn validate_owner_topic(topic: &str) -> Result<()> {
+    require(
+        !topic.trim().is_empty() && !topic.contains('\0') && topic.len() <= MAX_OWNER_TOPIC_BYTES,
+        "Owner topic must be nonempty, NUL-free and at most 4096 UTF-8 bytes",
+    )
+}
+fn valid_outreach(receipt: &Value) -> bool {
+    receipt["kind"] != "outreach"
+        || receipt["owner_topic"]
+            .as_str()
+            .is_some_and(|topic| validate_owner_topic(topic).is_ok())
+}
+fn model_executable(config: &Value) -> Result<PathBuf> {
+    let executable = match config.get("hermes_executable") {
+        Some(value) => PathBuf::from(
+            value
+                .as_str()
+                .ok_or("Hermes executable must be a path string")?,
+        ),
+        None => PathBuf::from(env::var_os("HOME").ok_or("HOME missing for default Hermes path")?)
+            .join(".local/bin/hermes"),
+    };
+    require(
+        executable.is_absolute() && !executable.as_os_str().as_encoded_bytes().contains(&0),
+        "Hermes executable must be an absolute Owner-configured path without NUL bytes",
+    )?;
+    Ok(executable)
+}
 fn model(home: &Path, config: &Value, payload: &Value) -> Result<String> {
     let home = fs::canonicalize(home)?;
     let task = if payload.get("owner_topic").is_some() {
@@ -129,16 +158,7 @@ fn model(home: &Path, config: &Value, payload: &Value) -> Result<String> {
         prompt.len() <= 100_000,
         "public model input exceeds local bound",
     )?;
-    let default_executable =
-        PathBuf::from(env::var_os("HOME").ok_or("HOME missing")?).join(".local/bin/hermes");
-    let executable = config["hermes_executable"]
-        .as_str()
-        .map(PathBuf::from)
-        .unwrap_or(default_executable);
-    require(
-        executable.is_absolute(),
-        "Hermes executable must be an absolute Owner-configured path",
-    )?;
+    let executable = model_executable(config)?;
     let mut command = Command::new(executable);
     command.env_clear();
     for name in [
@@ -353,6 +373,7 @@ mod tests {
     include!("correctness_tests.rs");
     include!("batch_tests.rs");
     include!("publication_tests.rs");
+    include!("patch_tests.rs");
     #[test]
     fn unusable_verification_page_does_not_stop_receipt_intake() {
         let mut c = fixture_client();
