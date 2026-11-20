@@ -1,14 +1,48 @@
-// Pre-publication corrections; only synthetic state and a local shell peer.
+// Pre-publication corrections; only synthetic state and compiled native peers.
+fn publication_peer(home: &Path, role: &str) -> PathBuf {
+    let filename = format!("{role}{}", env::consts::EXE_SUFFIX);
+    let peer = home.join(&filename);
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/native_regression_peer.rs");
+    // Keep the verbatim path for execution, but do not hand it to MinGW ld.
+    #[cfg(windows)]
+    let compiler_dir = match home.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(path) if path.as_bytes().get(1) == Some(&b':') => Path::new(path),
+        _ => home,
+    };
+    #[cfg(not(windows))]
+    let compiler_dir = home;
+    let output = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .current_dir(compiler_dir)
+        .args([
+            "--edition=2024",
+            "--crate-name",
+            "tolink_synthetic_regression_peer",
+        ])
+        .arg(source)
+        .arg("-o")
+        .arg(filename)
+        .output()
+        .expect("compile the std-only native synthetic peer");
+    assert!(
+        output.status.success(),
+        "native fixture compilation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    peer
+}
+fn publication_relative_fixture() -> Client {
+    // A drive-relative test must not depend on TMPDIR sharing the checkout's
+    // volume. Keep just this fixture in the ignored local build directory.
+    let parent = env::current_dir().unwrap().join("target");
+    fs::create_dir_all(&parent).unwrap();
+    fixture_client_in(&parent)
+}
 fn publication_persist_identity(c: &Client) {
     let ca = c.home.join("public-fixture-ca");
     fs::write(&ca, b"synthetic public CA bytes").unwrap();
     let seed = c.home.join("synthetic-private-seed");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&seed)
-        .unwrap();
+    let mut file = crate::platform::open_private_new(&seed).unwrap();
     file.write_all(URL_SAFE_NO_PAD.encode(c.key.to_bytes()).as_bytes())
         .unwrap();
     let mut config = c.config.clone();
@@ -18,17 +52,28 @@ fn publication_persist_identity(c: &Client) {
     config["ca_file"] = json!(ca);
     config["ca_sha256"] = json!(sha(b"synthetic public CA bytes"));
     // An accidental first request is an immediate local error, never a socket.
-    config["curl_executable"] = json!("/usr/bin/false");
+    config["curl_executable"] = json!(publication_peer(&c.home, "synthetic-false-transport"));
     config["model_daily_limit"] = json!(20);
     save(&c.home.join("config.json"), &config).unwrap();
     c.save().unwrap();
 }
 fn publication_relative(path: &Path) -> PathBuf {
+    let cwd = fs::canonicalize(env::current_dir().unwrap()).unwrap();
+    let path = fs::canonicalize(path).unwrap();
+    let ancestor = cwd
+        .ancestors()
+        .find(|base| path.starts_with(base))
+        .expect("relative-path fixtures and checkout must share a filesystem volume");
     let mut relative = PathBuf::new();
-    for _ in env::current_dir().unwrap().components().skip(1) {
+    for _ in cwd.strip_prefix(ancestor).unwrap().components() {
         relative.push("..");
     }
-    relative.join(path.strip_prefix("/").unwrap())
+    relative.push(path.strip_prefix(ancestor).unwrap());
+    assert!(
+        relative.is_relative(),
+        "control unexpectedly produced an absolute path"
+    );
+    relative
 }
 #[test]
 fn publication_outreach_dedupe_survives_terminal_pruning_and_restart() {
@@ -80,7 +125,7 @@ fn publication_outreach_dedupe_survives_terminal_pruning_and_restart() {
     .unwrap_err();
     assert!(
         control.to_string().contains("missing HTTP status"),
-        "new request did not reach local false transport control: {control}"
+        "new request did not reach native failed-transport control: {control}"
     );
     fs::remove_dir_all(home).unwrap();
 }
@@ -106,11 +151,11 @@ fn publication_outreach_dedupe_backfills_retained_legacy_evidence() {
     let before = c.state["outreach_request_ids"].clone();
     journal::prepare(&mut c.state).unwrap();
     assert_eq!(before, c.state["outreach_request_ids"]);
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
 }
 #[test]
 fn publication_relative_state_home_is_canonical_on_open() {
-    let c = fixture_client();
+    let c = publication_relative_fixture();
     publication_persist_identity(&c);
     let home = fs::canonicalize(&c.home).unwrap();
     drop(c);
@@ -124,12 +169,15 @@ fn publication_relative_state_home_is_canonical_on_open() {
 }
 #[test]
 fn publication_relative_model_home_uses_absolute_usage_path() {
-    let c = fixture_client();
+    let c = publication_relative_fixture();
     let home = fs::canonicalize(&c.home).unwrap();
-    let peer = home.join("synthetic-model-peer.sh");
-    fs::write(&peer, b"#!/bin/sh\nusage=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --usage-file ]; then shift; usage=$1; fi\n  shift\ndone\ncase \"$usage\" in /*) ;; *) exit 41 ;; esac\n[ \"${usage%/*}\" = \"$PWD\" ] || exit 42\nprintf '{\"synthetic\":true}\\n' > \"$usage\" || exit 43\nprintf '[SILENT]\\n'\n").unwrap();
-    fs::set_permissions(&peer, fs::Permissions::from_mode(0o700)).unwrap();
-    let config = json!({"hermes_executable":peer});
+    let peer = publication_peer(&home, "synthetic-model-peer");
+    fs::write(
+        home.join("synthetic-model-expected.txt"),
+        "synthetic path check",
+    )
+    .unwrap();
+    let config = json!({"hermes_executable":peer,"model_provider":"fixture-provider","model_name":"fixture-model","model_reasoning":"fixture-reasoning"});
     let payload = json!({"max_text_scalars":200,"trigger":{"text":"synthetic path check"}});
     assert_eq!(model(&home, &config, &payload).unwrap(), "[SILENT]");
     let usage = home.join("rust-model-usage.json");
@@ -141,5 +189,51 @@ fn publication_relative_model_home_uses_absolute_usage_path() {
         "[SILENT]"
     );
     assert_eq!(load(&usage).unwrap()["synthetic"], true);
-    fs::remove_dir_all(home).unwrap();
+    assert_eq!(load(&usage).unwrap()["stdin_utf8"], true);
+    cleanup_regression_fixture(c);
+}
+
+#[test]
+fn publication_model_uses_utf8_stdin_beyond_windows_command_line_limit() {
+    let c = fixture_client();
+    let home = fs::canonicalize(&c.home).unwrap();
+    let peer = publication_peer(&home, "synthetic-model-peer");
+    let text = "synthetic question 问题 ".repeat(2000);
+    assert!(
+        text.encode_utf16().count() > 32_767,
+        "counterexample must exceed Windows argv limit"
+    );
+    assert!(
+        text.len() < 90_000,
+        "control must fit the model input byte bound"
+    );
+    fs::write(home.join("synthetic-model-expected.txt"), &text).unwrap();
+    let config = json!({"hermes_executable":peer,"model_provider":"fixture-provider","model_name":"fixture-model","model_reasoning":"fixture-reasoning"});
+    let payload = json!({"max_text_scalars":200,"trigger":{"text":text}});
+    assert_eq!(model(&home, &config, &payload).unwrap(), "[SILENT]");
+    let usage = load(&home.join("rust-model-usage.json")).unwrap();
+    assert_eq!(usage["synthetic"], true);
+    assert_eq!(usage["stdin_utf8"], true);
+    cleanup_regression_fixture(c);
+}
+
+#[cfg(windows)]
+#[test]
+fn publication_curl_checks_header_routing_before_any_request() {
+    let c = fixture_client();
+    let base = "https://192.0.2.10/participant/v1/";
+    let ca = c.home.join("unused-fixture-ca.pem");
+    let old = publication_peer(&c.home, "synthetic-curl-old");
+    let rejection = wire(base, &ca, None, "self", "", None, &old);
+    assert!(
+        matches!(rejection, Err(ref error) if error.to_string().contains("curl 8.10.0")),
+        "old curl must be rejected before its request loses Retry-After"
+    );
+    assert!(!old.with_extension("requested").exists());
+    let current = publication_peer(&c.home, "synthetic-curl-current");
+    let response = wire(base, &ca, None, "self", "", None, &current).unwrap();
+    assert!(current.with_extension("requested").exists());
+    assert_eq!(response.status, 429);
+    assert_eq!(response.retry_after, Some(123));
+    cleanup_regression_fixture(c);
 }

@@ -3,11 +3,13 @@
 //! protocol decisions and pre-effect snapshot observations are Rust.
 //! Never point this peer at real identity/state or provider credentials.
 use serde_json::{Value, json};
+#[allow(dead_code)]
+#[path = "../../src/platform.rs"]
+mod platform;
 use std::{
     env, fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpStream},
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -19,22 +21,20 @@ fn load(path: &Path) -> Result<Value> {
 }
 fn publish(path: &Path, value: &Value) -> Result<()> {
     let tmp = path.with_extension("fixture-tmp");
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    let mut f = platform::open_private_new(&tmp)?;
     f.write_all(&serde_json::to_vec(value)?)?;
     f.sync_all()?;
+    drop(f);
     fs::rename(tmp, path)?;
     Ok(())
 }
 fn note(root: &Path, value: Value) -> Result<()> {
-    let mut f = fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(root.join("observations.jsonl"))?;
+    let path = root.join("observations.jsonl");
+    let mut f = if path.exists() {
+        fs::OpenOptions::new().append(true).open(path)?
+    } else {
+        platform::open_private_new(&path)?
+    };
     writeln!(f, "{value}")?;
     f.sync_all()?;
     Ok(())
@@ -246,7 +246,43 @@ fn synthetic_model(args: &[String]) -> Result<()> {
     {
         return Err("model capability/configuration flags not forwarded".into());
     }
-    let prompt = value("--oneshot")?;
+    let usage = Path::new(value("--usage-file")?);
+    let home = fs::canonicalize(env::current_dir()?)?;
+    let expected = [
+        "--safe-mode",
+        "--ignore-rules",
+        "--toolsets",
+        "",
+        "--provider",
+        "fixture-provider",
+        "--model",
+        "fixture-model",
+        "--reasoning",
+        value("--reasoning")?,
+        "--usage-file",
+        value("--usage-file")?,
+        "chat",
+        "--oneshot",
+        "--quiet",
+        "--query-file",
+        "-",
+    ];
+    if args.iter().map(String::as_str).ne(expected)
+        || value("--reasoning")?.is_empty()
+        || !usage.is_absolute()
+        || usage
+            .file_name()
+            .is_none_or(|name| name != "rust-model-usage.json")
+        || fs::canonicalize(usage.parent().ok_or("usage parent missing")?)? != home
+    {
+        return Err("native chat/stdin/absolute usage contract not forwarded".into());
+    }
+    let mut raw = Vec::new();
+    io::stdin().lock().take(100_001).read_to_end(&mut raw)?;
+    if raw.is_empty() || raw.len() > 100_000 {
+        return Err("synthetic model input outside bounded stdin contract".into());
+    }
+    let prompt = String::from_utf8(raw)?;
     let payload: Value =
         serde_json::from_str(prompt.rsplit_once('\n').ok_or("model JSON missing")?.1)?;
     if !prompt.contains("native fixture role")
@@ -263,7 +299,6 @@ fn synthetic_model(args: &[String]) -> Result<()> {
     {
         return Err("role or GET-self identity not forwarded".into());
     }
-    let home = env::current_dir()?;
     let disk = load(&home.join("state.json"))?;
     if disk["rust_generation"]["intent"]["trigger_id"] != payload["trigger"]["event_id"]
         || disk["model_budget"]["used"] != 1
@@ -283,12 +318,20 @@ fn synthetic_model(args: &[String]) -> Result<()> {
         &home.join("native-model-observed.json"),
         &json!({"observed":"before_synthetic_model","generation_id":disk["rust_generation"]["generation_id"],"synthetic":true,"real_provider_called":false,"batch_size":3}),
     )?;
+    publish(
+        usage,
+        &json!({"synthetic":true,"stdin_utf8":true,"real_provider_called":false}),
+    )?;
     println!("answer");
     Ok(())
 }
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.first().is_some_and(|v| v == "tls-server") {
+    if args == ["gateway", "attach", "--json"] {
+        // Match the shape of Hermes' readiness receipt; this is not a real ticket.
+        println!("{}", json!({"state":"ready"}));
+        Ok(())
+    } else if args.first().is_some_and(|v| v == "tls-server") {
         if args.len() != 4 && args.len() != 5 {
             return Err("tls-server ROOT OPENSSL PORT [-tls1_2|-tls1_3]".into());
         }

@@ -1,0 +1,23 @@
+{
+  "_documentation": "Documentation only: 192.0.2.10 is not a deployment endpoint. Every C:/Tolink or C:/Tools path and application/model identifier is a placeholder. Replace these with existing Owner-approved values. The all-zero CA pin is a NONTRUSTED PLACEHOLDER. The daily limit of 100 is an example, not spending or public-reply authorization. No installation, registration, migration, model call or public post is implied.",
+  "base_url": "https://192.0.2.10:8443/participant/v1/",
+  "authority": "192.0.2.10:8443",
+  "application": {
+    "agent_id": "replace-agent-id"
+  },
+  "key_file": "C:/Tolink/private-state/signing-seed.txt",
+  "ca_file": "C:/Tolink/private-state/owner-verified-ca.pem",
+  "ca_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "curl_executable": "C:/Tools/curl/bin/curl.exe",
+  "hermes_executable": "C:/Tools/hermes/hermes.exe",
+  "owner_authorization": {
+    "allow_public_replies": false
+  },
+  "model_daily_limit": 100,
+  "public_send_interval_seconds": 60,
+  "reply_batch_max": 3,
+  "model_provider": "replace-provider",
+  "model_name": "replace-model",
+  "model_reasoning": "minimal",
+  "public_role": "Respond carefully to public questions without disclosing private Owner information."
+}

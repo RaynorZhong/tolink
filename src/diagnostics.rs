@@ -1,10 +1,12 @@
 //! Offline, redacted diagnostics. No client, writer lock, process execution or network.
+use crate::platform::KeyMetadata;
 use crate::{Result, Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs::{self, Metadata},
-    io::{self, Read},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    io,
+    path::Path,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -66,7 +68,7 @@ pub(crate) fn config_report(config: &Value) -> Value {
         }
     } else {
         warnings.push(
-            "hermes_executable: defaults to HOME/.local/bin/hermes; presence not checked".into(),
+            if cfg!(windows) { "hermes_executable: defaults to LOCALAPPDATA/hermes/bin/hermes.exe; presence not checked" } else { "hermes_executable: defaults to HOME/.local/bin/hermes; presence not checked" }.into(),
         );
     }
     let pin = config["ca_sha256"].as_str();
@@ -140,47 +142,23 @@ fn io_status(error: &io::Error) -> &'static str {
         _ => "unreadable",
     }
 }
-fn same_file(a: &Metadata, b: &Metadata) -> bool {
-    a.dev() == b.dev() && a.ino() == b.ino()
-}
-
-// Reject special files before opening, then recheck the opened fd. O_NONBLOCK also
-// protects the regular-file-to-FIFO race. Never follow a final-component symlink.
 fn read_regular(
     path: &Path,
     limit: u64,
-    key: Option<&Metadata>,
+    key: Option<&KeyMetadata>,
 ) -> std::result::Result<Vec<u8>, &'static str> {
-    let before = fs::symlink_metadata(path).map_err(|e| io_status(&e))?;
-    if !before.is_file() {
-        return Err("not_regular");
+    crate::platform::read_regular(path, limit, key)
+}
+fn permission_mode(meta: &Metadata) -> Value {
+    #[cfg(unix)]
+    {
+        json!(format!("{:03o}", meta.permissions().mode() & 0o777))
     }
-    if key.is_some_and(|k| same_file(k, &before)) {
-        return Err("signing_key_read_refused");
+    #[cfg(windows)]
+    {
+        let _ = meta;
+        Value::Null
     }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| io_status(&e))?;
-    let meta = file.metadata().map_err(|e| io_status(&e))?;
-    if !meta.is_file() {
-        return Err("not_regular");
-    }
-    if key.is_some_and(|k| same_file(k, &meta)) {
-        return Err("signing_key_read_refused");
-    }
-    if meta.len() > limit {
-        return Err("too_large");
-    }
-    let mut raw = Vec::new();
-    file.take(limit + 1)
-        .read_to_end(&mut raw)
-        .map_err(|e| io_status(&e))?;
-    if raw.len() as u64 > limit {
-        return Err("too_large");
-    }
-    Ok(raw)
 }
 
 /// Input/parse failures are redacted diagnostic values, not raw OS/JSON errors.
@@ -214,13 +192,13 @@ fn file_metadata(path: &Path) -> Value {
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             json!({"status":if meta.is_file(){"regular"}else if meta.is_dir(){"directory"}else if meta.file_type().is_symlink(){"symlink"}else{"special"},
-            "regular_file":meta.is_file(),"size_bytes":meta.len(),"mode":format!("{:03o}",meta.permissions().mode() & 0o777),
+            "regular_file":meta.is_file(),"size_bytes":meta.len(),"mode":permission_mode(&meta),
             "modified_age_seconds":meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|t|epoch_now()-t.as_secs_f64())})
         }
         Err(error) => json!({"status":io_status(&error),"regular_file":false}),
     }
 }
-fn document(path: &Path, limit: u64, key: Option<&Metadata>) -> (Option<Value>, Value) {
+fn document(path: &Path, limit: u64, key: Option<&KeyMetadata>) -> (Option<Value>, Value) {
     let mut meta = file_metadata(path);
     let result = read_regular(path, limit, key).and_then(|raw| {
         let value: Value = serde_json::from_slice(&raw).map_err(|_| "invalid_json")?;
@@ -243,16 +221,32 @@ fn document(path: &Path, limit: u64, key: Option<&Metadata>) -> (Option<Value>, 
 }
 fn executable_metadata(path: Option<&Path>) -> Value {
     let Some(path) = path else {
-        return json!({"status":"not_configured","execution_verified":false,"presence_only":true,"executable_bits_set":false});
+        return json!({"status":"not_configured","execution_verified":false,"presence_only":true,"executable_bits_set":false,"launch_candidate":false});
     };
     let mut report = file_metadata(path);
     let target = fs::metadata(path).ok();
-    report["target_regular_file"] = json!(target.as_ref().is_some_and(|m| m.is_file()));
-    report["executable_bits_set"] = json!(
-        target
-            .as_ref()
-            .is_some_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    );
+    let regular = target.as_ref().is_some_and(|m| m.is_file());
+    #[cfg(unix)]
+    let candidate = target
+        .as_ref()
+        .is_some_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+    #[cfg(windows)]
+    let candidate = regular
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+    report["target_regular_file"] = json!(regular);
+    report["launch_candidate"] = json!(candidate);
+    #[cfg(unix)]
+    {
+        report["executable_bits_set"] = json!(candidate);
+        report["permission_model"] = json!("unix_mode_bits");
+    }
+    #[cfg(windows)]
+    {
+        report["executable_bits_set"] = Value::Null;
+        report["permission_model"] = json!("windows_acl_not_execution_verified");
+    }
     report["execution_verified"] = json!(false);
     report["presence_only"] = json!(true);
     report
@@ -478,19 +472,9 @@ fn process_view(process: Option<&Value>, warnings: &mut Vec<String>) -> Value {
     let pid = process["pid"]
         .as_u64()
         .filter(|n| *n > 0 && *n <= i32::MAX as u64);
-    // Signal zero checks existence/permission only: it delivers no signal and
-    // cannot establish command identity, ownership of this state, or liveness.
-    let exists = pid.and_then(|pid| {
-        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-            Some(true)
-        } else {
-            match io::Error::last_os_error().raw_os_error() {
-                Some(libc::ESRCH) => Some(false),
-                Some(libc::EPERM) => Some(true),
-                _ => None,
-            }
-        }
-    });
+    // Metadata-only existence/permission query: no signal is delivered and no
+    // command identity, state ownership or worker health is established.
+    let exists = pid.and_then(|pid| crate::platform::process_exists(pid as u32));
     if state == "unknown" {
         warnings.push("process: missing or unknown recorded status".into());
     }
@@ -541,23 +525,33 @@ pub(crate) fn doctor(home: &Path) -> Result<Value> {
         .unwrap_or(json!({"status":"not_configured","regular_file":false}));
     // Following a link for metadata also protects its target from CA/JSON alias
     // reads. The signing key itself must still be a private, nonsymlink file.
-    let key_meta = key_path.and_then(|p| fs::metadata(p).ok());
-    let private = key_meta
-        .as_ref()
-        .is_some_and(|m| m.permissions().mode() & 0o077 == 0);
-    let owner = key_meta
-        .as_ref()
-        .is_some_and(|m| m.uid() == unsafe { libc::geteuid() });
+    let key_meta = key_path.and_then(|p| crate::platform::key_metadata(p).ok());
+    let private = key_meta.as_ref().is_some_and(|m| m.private);
+    let owner = key_meta.as_ref().is_some_and(|m| m.owner);
     key_file["contents_read"] = json!(false);
     key_file["private_permissions"] = json!(private);
+    key_file["permission_model"] = json!(if cfg!(windows) {
+        "owner_sid_and_current_user_only_dacl"
+    } else {
+        "unix_owner_and_private_mode"
+    });
     key_file["owner_matches_current_user"] = json!(owner);
     if key_file["regular_file"] != true || !private || !owner {
         errors.push("key_file: missing, nonregular, symlinked, nonprivate or owned by another user; contents not read".into());
     }
-    let (state, state_file) = document(&home.join("state.json"), LOCAL_LIMIT, key_meta.as_ref());
-    let (last, self_file) = document(&home.join("last-self.json"), LOCAL_LIMIT, key_meta.as_ref());
-    let (process, process_file) =
-        document(&home.join("process.json"), CONFIG_LIMIT, key_meta.as_ref());
+    let key_identity_available = key_path.is_none() || key_meta.is_some();
+    let protected_document = |path: &Path, limit| {
+        if !key_identity_available {
+            let mut meta = file_metadata(path);
+            meta["read_status"] = json!("signing_key_identity_unavailable");
+            (None, meta)
+        } else {
+            document(path, limit, key_meta.as_ref())
+        }
+    };
+    let (state, state_file) = protected_document(&home.join("state.json"), LOCAL_LIMIT);
+    let (last, self_file) = protected_document(&home.join("last-self.json"), LOCAL_LIMIT);
+    let (process, process_file) = protected_document(&home.join("process.json"), CONFIG_LIMIT);
     if state.is_none() {
         errors.push(format!(
             "state.json: {}",
@@ -583,7 +577,13 @@ pub(crate) fn doctor(home: &Path) -> Result<Value> {
         .unwrap_or(json!({"status":"not_configured"}));
     let ca = configured_path(&config["ca_file"])
         .ok_or("not_configured")
-        .and_then(|p| read_regular(p, CONFIG_LIMIT, key_meta.as_ref()));
+        .and_then(|p| {
+            if !key_identity_available {
+                Err("signing_key_identity_unavailable")
+            } else {
+                read_regular(p, CONFIG_LIMIT, key_meta.as_ref())
+            }
+        });
     match ca {
         Ok(raw) => {
             let digest = crate::sha(&raw);
@@ -602,9 +602,7 @@ pub(crate) fn doctor(home: &Path) -> Result<Value> {
     }
     ca_file["trust_verified"] = json!(false);
     let curl = executable_metadata(configured_path(&config["curl_executable"]));
-    let default_hermes = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|p| p.join(".local/bin/hermes"));
+    let default_hermes = crate::platform::default_hermes_path().ok();
     let hermes_path = if config.get("hermes_executable").is_some() {
         absolute_path(&config["hermes_executable"])
     } else {
@@ -612,7 +610,7 @@ pub(crate) fn doctor(home: &Path) -> Result<Value> {
     };
     let hermes = executable_metadata(hermes_path);
     for (name, value) in [("curl_executable", &curl), ("hermes_executable", &hermes)] {
-        if value["executable_bits_set"] != true {
+        if value["launch_candidate"] != true {
             errors.push(format!(
                 "{name}: executable regular file not found by metadata checks"
             ));
@@ -645,14 +643,17 @@ pub(crate) fn doctor(home: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::os::windows::fs::MetadataExt;
     use std::{
         collections::BTreeMap,
-        ffi::CString,
-        os::{
-            fd::AsRawFd,
-            unix::fs::{MetadataExt, PermissionsExt, symlink},
-        },
+        path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
+    };
+    #[cfg(unix)]
+    use std::{
+        ffi::CString,
+        os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     };
 
     struct Fixture(PathBuf);
@@ -667,19 +668,28 @@ mod tests {
                 OffsetDateTime::now_utc().unix_timestamp_nanos(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir(&path).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            crate::platform::create_private_dir(&path).unwrap();
             Self(path)
         }
         fn write(&self, name: &str, raw: &[u8], mode: u32) -> PathBuf {
             let path = self.0.join(name);
             fs::write(&path, raw).unwrap();
+            #[cfg(unix)]
             fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            #[cfg(windows)]
+            let _ = mode;
             path
         }
         fn json(&self, name: &str, value: &Value) {
             self.write(name, &serde_json::to_vec(value).unwrap(), 0o600);
         }
+        #[cfg(windows)]
+        fn fifo(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            fs::create_dir(&path).unwrap();
+            path
+        }
+        #[cfg(unix)]
         fn fifo(&self, name: &str) -> PathBuf {
             let path = self.0.join(name);
             let c = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
@@ -697,7 +707,7 @@ mod tests {
             config["ca_file"] = json!(f.write("ca.pem", b"synthetic public CA bytes", 0o600));
             config["ca_sha256"] = json!(crate::sha(b"synthetic public CA bytes"));
             let executable = f.write(
-                "never-execute",
+                "never-execute.exe",
                 b"This is deliberately not an executable program.\n",
                 0o700,
             );
@@ -711,7 +721,7 @@ mod tests {
             f.json("process.json", &json!({"pid":std::process::id(),"state":"running","started_at":OffsetDateTime::now_utc().format(&Rfc3339).unwrap(),"build":build_info(),"reason":"SECRET-PROCESS"}));
             f
         }
-        fn snapshot(&self) -> BTreeMap<String, (u64, u32, i64, i64, u64)> {
+        fn snapshot(&self) -> BTreeMap<String, (u64, u32, u64, u64, u64)> {
             fs::read_dir(&self.0)
                 .unwrap()
                 .map(|entry| {
@@ -721,10 +731,10 @@ mod tests {
                         entry.file_name().to_string_lossy().into_owned(),
                         (
                             meta.len(),
-                            meta.mode(),
-                            meta.mtime(),
-                            meta.mtime_nsec(),
-                            meta.ino(),
+                            snapshot_fields(&meta).0,
+                            snapshot_fields(&meta).1,
+                            snapshot_fields(&meta).2,
+                            snapshot_fields(&meta).3,
                         ),
                     )
                 })
@@ -736,8 +746,41 @@ mod tests {
             fs::remove_dir_all(&self.0).unwrap();
         }
     }
+    fn snapshot_fields(meta: &Metadata) -> (u32, u64, u64, u64) {
+        #[cfg(unix)]
+        {
+            (
+                meta.mode(),
+                meta.mtime() as u64,
+                meta.mtime_nsec() as u64,
+                meta.ino(),
+            )
+        }
+        #[cfg(windows)]
+        {
+            (
+                meta.file_attributes(),
+                meta.last_write_time(),
+                meta.creation_time(),
+                0,
+            )
+        }
+    }
     fn example() -> Value {
-        serde_json::from_str(include_str!("../examples/config.example.json")).unwrap()
+        let config: Value =
+            serde_json::from_str(include_str!("../examples/config.example.json")).unwrap();
+        #[cfg(windows)]
+        {
+            let mut config = config;
+            config["hermes_executable"] = json!(
+                PathBuf::from(std::env::var_os("TMPDIR").unwrap()).join("synthetic-hermes.exe")
+            );
+            config
+        }
+        #[cfg(unix)]
+        {
+            config
+        }
     }
     fn strings_contain(value: &Value, needle: &str) -> bool {
         value
@@ -843,7 +886,9 @@ mod tests {
             .unwrap()
             .set_len(CONFIG_LIMIT + 1)
             .unwrap();
+        #[cfg(unix)]
         let link = f.0.join("link");
+        #[cfg(unix)]
         symlink(&invalid, &link).unwrap();
         for path in [
             f.0.clone(),
@@ -851,6 +896,7 @@ mod tests {
             f.fifo("fifo"),
             invalid,
             large,
+            #[cfg(unix)]
             link,
         ] {
             let report = validate_path(&path).unwrap();
@@ -880,16 +926,7 @@ mod tests {
             serde_json::from_slice(&fs::read(f.0.join("config.json")).unwrap()).unwrap();
         config["owner_authorization"]["allow_public_replies"] = json!(true);
         f.json("config.json", &config);
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(f.0.join("client.lock"))
-            .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        let _lock = crate::platform::lock_file(&f.0).unwrap();
         let before = f.snapshot();
         let report = doctor(&f.0).unwrap();
         assert_eq!(before, f.snapshot());
@@ -902,10 +939,7 @@ mod tests {
         assert_eq!(report["config"]["valid"], true);
         assert_eq!(report["files"]["key"]["contents_read"], false);
         assert_eq!(report["files"]["ca"]["pin_matches"], true);
-        assert_eq!(
-            report["files"]["curl_executable"]["executable_bits_set"],
-            true
-        );
+        assert_eq!(report["files"]["curl_executable"]["launch_candidate"], true);
         assert_eq!(
             report["files"]["curl_executable"]["execution_verified"],
             false
@@ -945,6 +979,28 @@ mod tests {
     }
 
     #[test]
+    fn doctor_refuses_ca_and_snapshot_reads_when_signing_key_identity_is_unavailable() {
+        let f = Fixture::populated();
+        let mut config: Value =
+            serde_json::from_slice(&fs::read(f.0.join("config.json")).unwrap()).unwrap();
+        config["key_file"] = json!(f.0.join("missing-key"));
+        fs::remove_file(f.0.join("ca.pem")).unwrap();
+        fs::hard_link(f.0.join("seed"), f.0.join("ca.pem")).unwrap();
+        f.json("config.json", &config);
+        let report = doctor(&f.0).unwrap();
+        assert_eq!(
+            report["files"]["ca"]["read_status"],
+            "signing_key_identity_unavailable"
+        );
+        assert_eq!(
+            report["files"]["state"]["read_status"],
+            "signing_key_identity_unavailable"
+        );
+        assert!(report["files"]["ca"].get("sha256").is_none());
+        assert_eq!(report["files"]["key"]["contents_read"], false);
+    }
+
+    #[test]
     fn doctor_never_reads_key_through_ca_or_snapshot_aliases() {
         let f = Fixture::populated();
         let mut config: Value =
@@ -970,8 +1026,19 @@ mod tests {
     #[test]
     fn doctor_checks_key_permissions_missing_executables_and_snapshot_health() {
         let f = Fixture::populated();
+        #[cfg(unix)]
         fs::set_permissions(f.0.join("seed"), fs::Permissions::from_mode(0o644)).unwrap();
-        fs::remove_file(f.0.join("never-execute")).unwrap();
+        #[cfg(windows)]
+        assert!(
+            std::process::Command::new("icacls.exe")
+                .arg(f.0.join("seed"))
+                .args(["/grant", "*S-1-5-18:(R)"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::remove_file(f.0.join("never-execute.exe")).unwrap();
         f.json("last-self.json", &json!({"checked_at":"2000-01-01T00:00:00Z","self":{"state":"SECRET-STATUS","timeline":"SECRET-TIMELINE","agent_id":"other-agent"}}));
         f.json("process.json", &json!({"state":"SECRET-PROCESS","pid":-1}));
         let report = doctor(&f.0).unwrap();
@@ -985,6 +1052,7 @@ mod tests {
         assert!(!report.to_string().contains("SECRET"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn doctor_rejects_special_files_and_never_opens_a_key_fifo() {
         let f = Fixture::populated();

@@ -38,7 +38,7 @@ fn capability_same_page_three_receipts_share_one_admission() {
     c.generate_one().unwrap();
     let state = c.state.clone();
     let model_calls = c.script.as_ref().unwrap().generation_calls;
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
     assert_eq!(model_calls, 1);
     assert_eq!(state["model_invocations"], 1);
     assert_eq!(
@@ -57,7 +57,7 @@ fn capability_silent_batch_decides_only_selected_receipts() {
     let mut c = batch_fixture("[SILENT]", false);
     c.generate_one().unwrap();
     let state = c.state.clone();
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
     assert_eq!(state["model_budget"]["used"], 1);
     for index in 0..3 {
         assert_eq!(state["inbox"][index]["status"], "silent");
@@ -87,7 +87,7 @@ fn capability_unknown_batch_retry_keeps_all_receipts_and_does_not_refund() {
     )
     .unwrap();
     let state = c.state.clone();
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
     for index in 0..4 {
         assert_eq!(state["inbox"][index]["status"], "received");
     }
@@ -134,7 +134,7 @@ fn capability_batch_respects_page_and_distinct_recipient_limits() {
             assert_eq!(c.state["inbox"][n]["status"], "received");
         }
         assert_eq!(c.state["model_budget"]["used"], 1);
-        fs::remove_dir_all(&c.home).unwrap();
+        cleanup_regression_fixture(c);
     }
 }
 
@@ -172,7 +172,7 @@ fn capability_nonprimary_batch_withdrawal_or_reset_blocks_both_recovery_paths() 
         assert!(c.state["rust_generation"].is_null());
         assert!(c.state["pending"].is_null());
         assert_eq!(c.state["model_budget"]["used"], 1);
-        fs::remove_dir_all(&c.home).unwrap();
+        cleanup_regression_fixture(c);
     }
 }
 
@@ -204,7 +204,7 @@ fn capability_unknown_batch_import_finishes_exactly_selected_receipts() {
     assert_eq!(c.state["inbox"][3]["status"], "received");
     assert_eq!(c.state["model_budget"]["used"], 1);
     assert_eq!(c.script.as_ref().unwrap().generation_calls, 1);
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn capability_nonprimary_draft_retraction_cancels_whole_batch_before_post() {
             .iter()
             .any(|(ep, _, _)| ep == "messages")
     );
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
 }
 
 #[test]
@@ -267,5 +267,5 @@ fn capability_batch_readback_requires_explicit_recipients_not_optional_reply_aut
             "readback lost an explicit batch recipient"
         );
     }
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
 }

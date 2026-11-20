@@ -29,7 +29,7 @@ fn patch_admission_refreshes_stale_self_before_discarding_public_receipts() {
     assert_eq!(disk["self"]["state"], "ACTIVE");
     assert_eq!(disk["cursor"], "fixture-after");
     assert_eq!(c.script.as_ref().unwrap().calls.len(), 1);
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
 }
 #[test]
 fn patch_deferred_admission_refresh_preserves_receipts_and_refresh_obligation() {
@@ -60,7 +60,7 @@ fn patch_deferred_admission_refresh_preserves_receipts_and_refresh_obligation() 
     c.refresh_self().unwrap().unwrap();
     assert_eq!(c.state["self_refresh_required"], false);
     assert_eq!(c.state["inbox"][0]["status"], "received");
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
 }
 #[test]
 fn patch_old_invalid_topic_finishes_before_network_or_budget_and_unblocks_queue() {
@@ -102,7 +102,7 @@ fn patch_old_invalid_topic_finishes_before_network_or_budget_and_unblocks_queue(
     c.generate_one().unwrap();
     assert_eq!(c.state["inbox"][1]["status"], "silent");
     assert_eq!(c.state["model_invocations"], 1);
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
 }
 #[test]
 fn patch_new_oversized_speak_is_refused_before_client_open() {
@@ -131,7 +131,7 @@ fn patch_new_oversized_speak_is_refused_before_client_open() {
         !control.to_string().contains("Owner topic"),
         "valid topic did not reach ordinary missing-home control"
     );
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
 }
 fn patch_retry_fixture() -> Client {
     let mut c = batch_fixture("answer", true);
@@ -181,7 +181,7 @@ fn patch_retry_membership_survives_restart_and_new_batch_limit() {
     assert_eq!(c.state["pending"]["body"]["reply_to_event_id"], "batch-2");
     assert_eq!(c.state["inbox"][2]["status"], "received");
     assert_eq!(c.state["model_budget"]["used"], 2);
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
 }
 #[test]
 fn patch_retry_nonprimary_withdrawal_blocks_the_saved_group_before_model() {
@@ -215,7 +215,7 @@ fn patch_retry_nonprimary_withdrawal_blocks_the_saved_group_before_model() {
     assert_eq!(c.state["inbox"][1]["status"], "discarded");
     assert_eq!(c.state["inbox"][2]["status"], "received");
     assert_eq!(c.state["model_budget"]["used"], 1);
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
 }
 #[test]
 fn patch_invalid_model_path_is_rejected_before_admission() {
@@ -229,5 +229,5 @@ fn patch_invalid_model_path_is_rejected_before_admission() {
     assert!(result.is_err());
     assert!(c.state["rust_generation"].is_null());
     assert_eq!(c.state["inbox"][0]["status"], "received");
-    fs::remove_dir_all(&c.home).unwrap();
+    cleanup_regression_fixture(c);
 }

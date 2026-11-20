@@ -76,7 +76,7 @@ impl Client {
             self.state["http_failures"][endpoint] = json!(failures);
             if response.retry_after.is_none() {
                 let mut jitter = [0u8; 1];
-                File::open("/dev/urandom")?.read_exact(&mut jitter)?;
+                crate::platform::random_bytes(&mut jitter)?;
                 self.block(
                     ((1u64 << failures.saturating_sub(1).min(6)) as f64
                         * (1.0 + jitter[0] as f64 / 512.0))
@@ -832,6 +832,24 @@ impl Client {
         let intent = json!({"kind":if outreach{"outreach"}else{"reply"},"trigger_id":id,"trigger_ids":work["trigger_ids"],"timeline":timeline,"reply_to_event_id":if outreach{Value::Null}else{json!(id)},"reply_mentions":reply_mentions,"recipient_id":if outreach{json!(target)}else{Value::Null},"allowed_mentions":allowed,"max_text_scalars":current["limits"]["max_text_scalars"]});
         let generation =
             json!({"generation_id":token()?,"started_at":utc()?,"phase":"started","intent":intent});
+        #[cfg(windows)]
+        {
+            #[cfg(not(test))]
+            let check_gateway = true;
+            // Tests with a fully scripted model need no native executable. An explicit
+            // synthetic launcher can still exercise readiness with a scripted roster.
+            #[cfg(test)]
+            let check_gateway =
+                self.script.is_none() || self.config.get("hermes_executable").is_some();
+            if check_gateway && let Err(error) = check_model_gateway(&self.home, &self.config) {
+                if crate::process::cleanup_unconfirmed(error.as_ref()) {
+                    self.state["owned_cleanup_unconfirmed"] = json!(true);
+                    self.save()?;
+                }
+                return Err(error);
+            }
+        }
+        require(!STOP.load(Ordering::Relaxed), "owner_stop_before_model")?;
         let reservation_day = self.budget_day();
         journal::reserve(&mut self.state, &self.config, &reservation_day, generation)?;
         self.save()?;

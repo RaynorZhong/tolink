@@ -1,13 +1,31 @@
 //! Local Owner commands. Inspection/recovery do not read the identity seed or call a service.
 use super::*;
 
+fn key_guard(config: &Value) -> Result<Option<crate::platform::KeyMetadata>> {
+    match config.get("key_file") {
+        None => Ok(None),
+        Some(value) => {
+            let path = value
+                .as_str()
+                .filter(|p| !p.is_empty() && !p.contains('\0'))
+                .ok_or("signing key path invalid; offline content reads refused")?;
+            Ok(Some(crate::platform::key_metadata(Path::new(path))?))
+        }
+    }
+}
+fn offline_document(path: &Path, config: &Value) -> Result<Value> {
+    let key = key_guard(config)?;
+    let bytes = crate::platform::read_private_regular(path, u64::MAX, key.as_ref())
+        .map_err(|code| io::Error::new(io::ErrorKind::InvalidData, code))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
 fn offline(home: &Path) -> Result<(Value, Value)> {
     let config = if home.join("config.json").exists() {
         load(&home.join("config.json"))?
     } else {
         json!({})
     };
-    let mut state = load(&home.join("state.json"))?;
+    let mut state = offline_document(&home.join("state.json"), &config)?;
     journal::prepare(&mut state)?;
     Ok((config, state))
 }
@@ -43,7 +61,7 @@ pub(crate) fn status(home: &Path) -> Result<()> {
         .sum();
     let inbox = journal::receipts(&state)?;
     let process = if home.join("process.json").exists() {
-        load(&home.join("process.json"))?
+        offline_document(&home.join("process.json"), &config)?
     } else {
         Value::Null
     };
@@ -72,26 +90,19 @@ pub(crate) fn recover(
         id == confirm,
         "confirmation must match the exact generation ID",
     )?;
+    let directory = crate::platform::pin_private_dir(home)?;
+    let home = directory.path.as_path();
     let _guard = lock(home)?;
-    let (_, mut state) = offline(home)?;
+    let (config, mut state) = offline(home)?;
     require(
         state["owned_cleanup_unconfirmed"] != true,
         "owned process cleanup is unconfirmed; inspect native processes before further operations; this command does not bypass that gate",
     )?;
     let imported = if let Some(path) = import_path {
-        let mut file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        require(metadata.is_file(), "import result must be a regular file")?;
         const LIMIT: u64 = 4 * 1024 * 1024;
-        require(metadata.len() <= LIMIT, "import result exceeds 4 MiB")?;
-        let mut raw = Vec::new();
-        Read::by_ref(&mut file)
-            .take(LIMIT + 1)
-            .read_to_end(&mut raw)?;
-        require(raw.len() as u64 <= LIMIT, "import result exceeds 4 MiB")?;
+        let key = key_guard(&config)?;
+        let raw = crate::platform::read_private_regular(path, LIMIT, key.as_ref())
+            .map_err(|code| io::Error::new(io::ErrorKind::InvalidData, code))?;
         Some(serde_json::from_slice(&raw)?)
     } else {
         None
@@ -112,7 +123,7 @@ pub(crate) fn recover(
     Ok(())
 }
 pub(crate) fn fresh_self(home: &Path) -> Result<()> {
-    install_signals();
+    install_signals()?;
     match Client::open(home) {
         Ok(mut client) => {
             let current = client
@@ -147,7 +158,7 @@ pub(crate) fn fresh_self(home: &Path) -> Result<()> {
 }
 pub(crate) fn speak(home: &Path, recipient: &str, topic: &str, request_id: &str) -> Result<()> {
     validate_owner_topic(topic)?;
-    install_signals();
+    install_signals()?;
     let mut client = Client::open(home)?;
     require(
         client.state["pending"].is_null(),
@@ -279,7 +290,9 @@ pub(crate) fn speak(home: &Path, recipient: &str, topic: &str, request_id: &str)
     Ok(())
 }
 pub(crate) fn model_check(home: &Path) -> Result<()> {
-    install_signals();
+    install_signals()?;
+    let directory = crate::platform::pin_private_dir(home)?;
+    let home = directory.path.as_path();
     let _guard = lock(home)?;
     let (config, mut state) = offline(home)?;
     require(
@@ -295,6 +308,26 @@ pub(crate) fn model_check(home: &Path) -> Result<()> {
     let payload = json!({"notice":"不发布的连接检查；合成公开问题。","identity":identity,"timeline":"test-not-published","participants":[],"context":[],"trigger":{"kind":"agent_message","text":"面对一次请求超时，为什么不能立即断定服务端没有完成操作？请用一句话回答。"},"max_text_scalars":200});
     model_executable(&config)?;
     let generation = json!({"generation_id":id,"started_at":utc()?,"phase":"started","intent":{"kind":"diagnostic","trigger_id":id,"timeline":"test-not-published","allowed_mentions":[],"max_text_scalars":200}});
+    #[cfg(windows)]
+    {
+        require(
+            state["rust_generation"].is_null(),
+            "previous generation unresolved; no automatic retry",
+        )?;
+        let day = OffsetDateTime::now_utc().date().to_string();
+        require(
+            journal::budget(&mut state, &config, &day)?["reason"] == "available",
+            "finite daily model budget unavailable",
+        )?;
+        if let Err(error) = check_model_gateway(home, &config) {
+            if crate::process::cleanup_unconfirmed(error.as_ref()) {
+                state["owned_cleanup_unconfirmed"] = json!(true);
+                save(&home.join("state.json"), &state)?;
+            }
+            return Err(error);
+        }
+    }
+    require(!STOP.load(Ordering::Relaxed), "owner_stop_before_model")?;
     journal::reserve(
         &mut state,
         &config,

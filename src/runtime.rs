@@ -6,7 +6,6 @@ use crate::journal::{append_id, contains};
 use std::{
     fs::File,
     io,
-    os::fd::AsRawFd,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -19,14 +18,9 @@ mod flow;
 #[path = "operations.rs"]
 mod operations;
 static STOP: AtomicBool = AtomicBool::new(false);
-fn install_signals() {
-    unsafe {
-        libc::signal(libc::SIGTERM, stop as *const () as usize);
-        libc::signal(libc::SIGINT, stop as *const () as usize);
-    }
-}
-extern "C" fn stop(_: libc::c_int) {
-    STOP.store(true, Ordering::Relaxed);
+fn install_signals() -> Result<()> {
+    crate::platform::install_stop_handler(&STOP)?;
+    Ok(())
 }
 fn now() -> f64 {
     SystemTime::now()
@@ -54,47 +48,24 @@ fn number(v: &Value, k: &str) -> f64 {
     v[k].as_f64().unwrap_or(0.0)
 }
 fn load(path: &Path) -> Result<Value> {
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
+    // Preserve the predecessor's journal admission. Diagnostic/import documents
+    // retain their explicit bounds; they are not the mutable runtime journal.
+    let raw = crate::platform::read_private_regular(path, u64::MAX, None)
+        .map_err(|code| io::Error::new(io::ErrorKind::InvalidData, code))?;
+    Ok(serde_json::from_slice(&raw)?)
 }
 fn save(path: &Path, value: &Value) -> Result<()> {
-    let temporary = path.with_extension(format!("rust-tmp-{}-{}", std::process::id(), token()?));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    let committed = (|| -> Result<()> {
-        file.write_all(&serde_json::to_vec(value)?)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        Ok(())
-    })();
-    if let Err(error) = committed {
-        // Only this invocation's exclusively created, not-yet-renamed temp is ours.
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    File::open(path.parent().ok_or("missing parent")?)?.sync_all()?;
+    let mut raw = serde_json::to_vec(value)?;
+    raw.push(b'\n');
+    crate::platform::atomic_write(path, &raw)?;
     Ok(())
 }
 fn lock(home: &Path) -> Result<File> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(home.join("client.lock"))?;
-    // flock matches the predecessor's Unix request-lane lock; no unlink/replacement.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(file)
+    Ok(crate::platform::lock_file(home)?)
 }
 fn token() -> Result<String> {
     let mut bytes = [0u8; 24];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    crate::platform::random_bytes(&mut bytes)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
@@ -126,8 +97,7 @@ fn model_executable(config: &Value) -> Result<PathBuf> {
                 .as_str()
                 .ok_or("Hermes executable must be a path string")?,
         ),
-        None => PathBuf::from(env::var_os("HOME").ok_or("HOME missing for default Hermes path")?)
-            .join(".local/bin/hermes"),
+        None => crate::platform::default_hermes_path()?,
     };
     require(
         executable.is_absolute() && !executable.as_os_str().as_encoded_bytes().contains(&0),
@@ -135,8 +105,82 @@ fn model_executable(config: &Value) -> Result<PathBuf> {
     )?;
     Ok(executable)
 }
+fn hermes_command(home: &Path, config: &Value) -> Result<Command> {
+    require(home.is_absolute(), "model state directory must be absolute")?;
+    let executable = model_executable(config)?;
+    let mut command = Command::new(executable);
+    command.env_clear();
+    for name in [
+        "HOME",
+        "PATH",
+        "LANG",
+        "TMPDIR",
+        "SystemRoot",
+        "WINDIR",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "TEMP",
+        "TMP",
+        "HERMES_HOME",
+        "HERMES_PROFILE",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ] {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.current_dir(home);
+    Ok(command)
+}
+
+#[cfg(windows)]
+fn check_model_gateway(home: &Path, config: &Value) -> Result<()> {
+    // No --start/--recover: this only discovers an existing owner for the same profile.
+    // The receipt contains a single-use ticket. Inspect only the verdict, never print,
+    // persist or dial with it. Status zero can also mean draining/restart_wait.
+    // This is a snapshot, not a lease: the separate chat invocation still calls ensure.
+    let mut command = hermes_command(&fs::canonicalize(home)?, config)?;
+    command.args(["gateway", "attach", "--json"]);
+    let output = capture(command, b"", 10, true)?;
+    require(
+        output.status.success()
+            && serde_json::from_slice::<Value>(&output.stdout)
+                .is_ok_and(|receipt| receipt["state"] == "ready"),
+        "Hermes gateway is not ready for this profile (attach-only check failed)",
+    )
+}
+
+fn model_command(home: &Path, config: &Value, prompt: &str) -> Result<Command> {
+    require(
+        prompt.len() <= 100_000,
+        "public model input exceeds local bound",
+    )?;
+    let mut command = hermes_command(home, config)?;
+    command
+        .args([
+            "--safe-mode",
+            "--ignore-rules",
+            "--toolsets",
+            "",
+            "--provider",
+            config["model_provider"].as_str().unwrap_or("openai-codex"),
+            "--model",
+            config["model_name"].as_str().unwrap_or("gpt-6.1-sol-900k"),
+            "--reasoning",
+            config["model_reasoning"].as_str().unwrap_or("minimal"),
+            "--usage-file",
+        ])
+        .arg(home.join("rust-model-usage.json"))
+        .args(["chat", "--oneshot", "--quiet", "--query-file", "-"]);
+    Ok(command)
+}
 fn model(home: &Path, config: &Value, payload: &Value) -> Result<String> {
-    let home = fs::canonicalize(home)?;
+    let directory = crate::platform::pin_private_dir(home)?;
+    let home = fs::canonicalize(&directory.path)?;
     let task = if payload.get("owner_topic").is_some() {
         "Owner本次明确授权主动向recipient发起讨论。围绕owner_topic开启一个新话题，不把历史消息当作刚收到的提问；先提出一个具体看法，再向对方问一个容易回应的问题，约200至400字，不虚构对方说过的话。只提及指定recipient，正文必须以其@agent_id开头。不公开Owner私人信息、本机实现或本机运行情况。"
     } else if payload["triggers"]
@@ -158,44 +202,10 @@ fn model(home: &Path, config: &Value, payload: &Value) -> Result<String> {
         prompt.len() <= 100_000,
         "public model input exceeds local bound",
     )?;
-    let executable = model_executable(config)?;
-    let mut command = Command::new(executable);
-    command.env_clear();
-    for name in [
-        "HOME",
-        "PATH",
-        "LANG",
-        "TMPDIR",
-        "HTTPS_PROXY",
-        "HTTP_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-    ] {
-        if let Some(value) = env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-    command
-        .current_dir(&home)
-        .args([
-            "--safe-mode",
-            "--ignore-rules",
-            "--toolsets",
-            "",
-            "--provider",
-            config["model_provider"].as_str().unwrap_or("openai-codex"),
-            "--model",
-            config["model_name"].as_str().unwrap_or("gpt-6.1-sol-900k"),
-            "--reasoning",
-            config["model_reasoning"].as_str().unwrap_or("minimal"),
-            "--usage-file",
-        ])
-        .arg(home.join("rust-model-usage.json"))
-        .arg("--oneshot")
-        .arg(prompt);
+    let command = model_command(&home, config, &prompt)?;
     // Finish the bounded in-flight model on graceful stop, then persist its result before exit.
     require(!STOP.load(Ordering::Relaxed), "owner_stop_before_model")?;
-    let result = capture(command, b"", 180, false)?;
+    let result = capture(command, prompt.as_bytes(), 180, false)?;
     require(
         result.status.success(),
         "isolated Hermes model failed; no fallback reply",
@@ -253,12 +263,14 @@ struct Client {
     request_gate: Instant,
     send_gate: Instant,
     _lock: File,
+    _directory: crate::platform::PrivateDir,
     #[cfg(test)]
     script: Option<tests::Script>,
 }
 impl Client {
     fn open(home: &Path) -> Result<Self> {
-        let home = fs::canonicalize(home)?;
+        let directory = crate::platform::pin_private_dir(home)?;
+        let home = fs::canonicalize(&directory.path)?;
         let guard = lock(&home)?;
         let config = load(&home.join("config.json"))?;
         let authority = text(&config, "base_url")?
@@ -297,6 +309,7 @@ impl Client {
             request_gate,
             send_gate,
             _lock: guard,
+            _directory: directory,
             #[cfg(test)]
             script: None,
         })
@@ -315,13 +328,9 @@ impl Client {
         let path = self.home.join("rust-client.log");
         let raw = format!("{}\n", json!({"at":utc()?, "event":event, "fields":fields}));
         if fs::metadata(&path).map(|m| m.len()).unwrap_or(0) + raw.len() as u64 > 131072 {
-            fs::rename(&path, self.home.join("rust-client.log.1"))?;
+            crate::platform::replace_file(&path, &self.home.join("rust-client.log.1"))?;
         }
-        let mut f = fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(path)?;
+        let mut f = crate::platform::append_private(&path)?;
         f.write_all(raw.as_bytes())?;
         Ok(())
     }
@@ -349,7 +358,7 @@ fn encode(value: &str) -> String {
         .collect()
 }
 pub(super) fn run(home: &Path) -> Result<()> {
-    install_signals();
+    install_signals()?;
     let mut client = Client::open(home)?;
     let result = client.run();
     client.save()?;
@@ -374,6 +383,188 @@ mod tests {
     include!("batch_tests.rs");
     include!("publication_tests.rs");
     include!("patch_tests.rs");
+    #[cfg(windows)]
+    include!("model_admission_tests.rs");
+
+    #[cfg(windows)]
+    fn grant_foreign_read_write(path: &Path) {
+        let result = Command::new("icacls.exe")
+            .arg(path)
+            .args(["/grant", "*S-1-1-0:(R,W)"])
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        assert!(!crate::platform::key_metadata(path).unwrap().private);
+    }
+
+    #[cfg(windows)]
+    fn runtime_refuses_foreign_acl(filename: &str) {
+        let mut fixture = fixture_client();
+        let home = fixture.home.clone();
+        let seed = home.join("fixture.seed");
+        let ca = home.join("fixture-ca.pem");
+        // Ordinary creation models migrated files inheriting from the private root.
+        fs::write(&seed, URL_SAFE_NO_PAD.encode([7; 32])).unwrap();
+        fs::write(&ca, b"synthetic CA pin input").unwrap();
+        fixture.config["key_file"] = json!(seed);
+        fixture.config["ca_file"] = json!(ca);
+        fixture.config["ca_sha256"] = json!(sha(b"synthetic CA pin input"));
+        fixture.config["base_url"] = json!("https://localhost/participant/v1/");
+        fixture.config["authority"] = json!("localhost");
+        fs::write(home.join("config.json"), fixture.config.to_string()).unwrap();
+        fs::write(home.join("state.json"), fixture.state.to_string()).unwrap();
+        drop(fixture);
+        drop(Client::open(&home).expect("private inherited config, key and state must work"));
+
+        grant_foreign_read_write(&home.join(filename));
+        let error = Client::open(&home).err();
+        fs::remove_dir_all(home).unwrap();
+        assert_eq!(
+            error.as_ref().map(ToString::to_string).as_deref(),
+            Some("permission_denied")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_acl_refuses_foreign_config_before_opening_client() {
+        runtime_refuses_foreign_acl("config.json");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_acl_refuses_foreign_state_before_opening_client() {
+        runtime_refuses_foreign_acl("state.json");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_acl_refuses_foreign_self_request_before_using_id() {
+        let mut c = fixture_client();
+        journal::prepare(&mut c.state).unwrap();
+        let request = c.home.join("self-request.json");
+        save(&request, &json!({"request_id":"synthetic-request"})).unwrap();
+        grant_foreign_read_write(&request);
+        c.script = Some(Script::new(vec![(
+            "self",
+            "",
+            response(200, fixture_self()),
+        )]));
+        let result = c.refresh_self();
+        let snapshot_written = c.home.join("last-self.json").exists();
+        let home = c.home.clone();
+        drop(c);
+        fs::remove_dir_all(home).unwrap();
+        assert_eq!(result.unwrap_err().to_string(), "permission_denied");
+        assert!(
+            !snapshot_written,
+            "an untrusted request ID reached a snapshot"
+        );
+    }
+
+    #[test]
+    fn model_command_uses_bounded_utf8_stdin_and_native_runtime_allowlist() {
+        let home = PathBuf::from(env::var_os("TMPDIR").expect("test TMPDIR"));
+        let prompt = "Unicode 输入 must not appear in argv ".repeat(1200);
+        let command = model_command(&home, &json!({"model_provider":"fixture-provider","model_name":"fixture-model","model_reasoning":"minimal"}), &prompt).unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.ends_with(&[
+                "chat".into(),
+                "--oneshot".into(),
+                "--quiet".into(),
+                "--query-file".into(),
+                "-".into()
+            ]),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a.contains("Unicode 输入")));
+        assert!(args.windows(2).any(|a| a == ["--toolsets", ""]));
+        assert!(args.contains(&"--safe-mode".into()) && args.contains(&"--ignore-rules".into()));
+        let usage = args.windows(2).find(|a| a[0] == "--usage-file").unwrap();
+        assert!(Path::new(&usage[1]).is_absolute());
+        let child_env: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
+            .collect();
+        for name in [
+            "SystemRoot",
+            "WINDIR",
+            "USERPROFILE",
+            "LOCALAPPDATA",
+            "APPDATA",
+            "TEMP",
+            "TMP",
+            "HERMES_HOME",
+            "HERMES_PROFILE",
+        ] {
+            if let Some(value) = env::var_os(name) {
+                assert_eq!(
+                    child_env.get(std::ffi::OsStr::new(name)),
+                    Some(&value),
+                    "missing runtime path {name}"
+                );
+            }
+        }
+        for name in [
+            "OPENAI_API_KEY",
+            "HERMES_CONFIG",
+            "HERMES_ENV",
+            "HERMES_YOLO_MODE",
+            "HERMES_GATEWAY_URL",
+            "PYTHONPATH",
+            "NODE_OPTIONS",
+        ] {
+            assert!(
+                !child_env.contains_key(std::ffi::OsStr::new(name)),
+                "secret or policy override inherited: {name}"
+            );
+        }
+        assert!(model_command(&home, &json!({}), &"x".repeat(100001)).is_err());
+    }
+
+    #[test]
+    fn offline_owner_commands_refuse_state_hardlinked_to_the_signing_key() {
+        let c = fixture_client();
+        let seed = c.home.join("synthetic-private-seed");
+        save(&seed, &c.state).unwrap();
+        save(&c.home.join("config.json"), &json!({"key_file":seed})).unwrap();
+        fs::hard_link(&seed, c.home.join("state.json")).unwrap();
+        assert!(
+            operations::status(&c.home).is_err(),
+            "offline status must not read the signing key through a state alias"
+        );
+        assert!(
+            operations::inspect(&c.home).is_err(),
+            "offline inspect must not read the signing key through a state alias"
+        );
+        let home = c.home.clone();
+        drop(c);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn runtime_json_load_preserves_existing_large_journal_admission() {
+        let mut c = fixture_client();
+        c.state["synthetic_preserved_extension"] = json!("x".repeat(4 * 1024 * 1024 + 1));
+        c.save().unwrap();
+        let loaded = load(&c.home.join("state.json")).expect(
+            "runtime must not impose the diagnostic document size limit on an existing journal",
+        );
+        assert_eq!(
+            loaded["synthetic_preserved_extension"],
+            c.state["synthetic_preserved_extension"]
+        );
+        operations::status(&c.home)
+            .expect("offline journal view must preserve the original runtime size admission");
+        let home = c.home.clone();
+        drop(c);
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn unusable_verification_page_does_not_stop_receipt_intake() {
         let mut c = fixture_client();
@@ -403,7 +594,9 @@ mod tests {
         c.page(&page, true).unwrap();
         assert_eq!(c.state["inbox"][0]["event_id"], "another-new-question");
         assert_eq!(c.state["cursor"], "fixture-after");
-        fs::remove_dir_all(&c.home).unwrap();
+        let home = c.home.clone();
+        drop(c);
+        fs::remove_dir_all(home).unwrap();
     }
     pub(super) struct Script {
         requests: std::collections::VecDeque<(&'static str, &'static str, WireResponse)>,
@@ -505,17 +698,16 @@ mod tests {
         json!({"event_id":"our-fixture-event","seq":80,"kind":"agent_message","agent":{"agent_id":"fixture-agent"},"text":"answer","reply_to":{"event_id":"fixture-question"},"mentions":[{"agent_id":"fixture-peer"}],"retracted":false})
     }
     fn fixture_client() -> Client {
-        use std::os::unix::fs::DirBuilderExt;
-        let home = PathBuf::from(env::var("TMPDIR").expect("test TMPDIR"))
-            .join(format!("tolink-receipt-test-{}", token().unwrap()));
-        fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
+        fixture_client_in(&PathBuf::from(env::var("TMPDIR").expect("test TMPDIR")))
+    }
+    fn fixture_client_in(parent: &Path) -> Client {
+        let home = parent.join(format!("tolink-receipt-test-{}", token().unwrap()));
+        crate::platform::create_private_dir(&home).unwrap();
         let mut seed = [0u8; 32];
-        File::open("/dev/urandom")
-            .unwrap()
-            .read_exact(&mut seed)
-            .unwrap();
+        crate::platform::random_bytes(&mut seed).unwrap();
         Client {
             _lock: lock(&home).unwrap(),
+            _directory: crate::platform::pin_private_dir(&home).unwrap(),
             home,
             config: json!({"owner_authorization":{"allow_public_replies":true},"application":{"agent_id":"fixture-agent"},"public_send_interval_seconds":60,"reply_batch_max":1}),
             state: json!({"cursor":"fixture-before","timeline":"public","context":[],"handled":[],"own_event_ids":[],"pending":null,"model_invocations":0}),
@@ -540,7 +732,9 @@ mod tests {
                 .any(|item| item["event_id"] == "fixture-question")),
             "cursor advanced but the unread directed question was silently lost"
         );
-        fs::remove_dir_all(&client.home).unwrap();
+        let home = client.home.clone();
+        drop(client);
+        fs::remove_dir_all(home).unwrap();
     }
     #[test]
     fn initial_and_reset_history_are_not_live_receipts() {
@@ -548,7 +742,9 @@ mod tests {
             let mut client = fixture_client();
             client.page(&old_directed_page(reset), had_cursor).unwrap();
             assert!(client.state["inbox"].as_array().is_none_or(Vec::is_empty));
-            fs::remove_dir_all(&client.home).unwrap();
+            let home = client.home.clone();
+            drop(client);
+            fs::remove_dir_all(home).unwrap();
         }
     }
     #[test]
@@ -636,7 +832,9 @@ mod tests {
             1
         );
         assert!(c.script.as_ref().unwrap().requests.is_empty());
-        fs::remove_dir_all(&c.home).unwrap();
+        let home = c.home.clone();
+        drop(c);
+        fs::remove_dir_all(home).unwrap();
     }
     #[test]
     fn ambiguous_post_keeps_original_body_and_anchor_across_retry() {
@@ -699,7 +897,9 @@ mod tests {
             .collect();
         assert_eq!(posts[0].2, posts[1].2);
         assert_eq!(posts[0].2.as_ref().unwrap(), &pending["body"]);
-        fs::remove_dir_all(&c.home).unwrap();
+        let home = c.home.clone();
+        drop(c);
+        fs::remove_dir_all(home).unwrap();
     }
     #[test]
     fn generation_failure_preserves_budget_and_all_later_receipts() {
@@ -727,7 +927,9 @@ mod tests {
         assert_eq!(c.state["cursor"], "later-cursor");
         assert_eq!(c.state["inbox"].as_array().unwrap().len(), 2);
         assert_eq!(c.script.as_ref().unwrap().generation_calls, 1);
-        fs::remove_dir_all(&c.home).unwrap();
+        let home = c.home.clone();
+        drop(c);
+        fs::remove_dir_all(home).unwrap();
     }
     #[test]
     fn silent_result_is_a_durable_decision_not_a_free_model_call() {
@@ -763,7 +965,9 @@ mod tests {
         assert!(disk["pending"].is_null());
         c.generate_receipt(&receipt, &fixture_self()).unwrap();
         assert_eq!(c.script.as_ref().unwrap().generation_calls, 1);
-        fs::remove_dir_all(&c.home).unwrap();
+        let home = c.home.clone();
+        drop(c);
+        fs::remove_dir_all(home).unwrap();
     }
     #[test]
     #[ignore = "requires explicitly started Rust/OpenSSL fixture; no real model or room"]
@@ -776,12 +980,7 @@ mod tests {
         let home = seed_client.home.clone();
         let port = settings["port"].as_u64().unwrap();
         let key_path = home.join("fixture.seed");
-        let mut key_file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&key_path)
-            .unwrap();
+        let mut key_file = crate::platform::open_private_new(&key_path).unwrap();
         key_file
             .write_all(
                 URL_SAFE_NO_PAD
@@ -913,7 +1112,9 @@ mod tests {
             } else {
                 assert_eq!(c.state["rust_generation"]["phase"], "result_rejected");
             }
-            fs::remove_dir_all(&c.home).unwrap();
+            let home = c.home.clone();
+            drop(c);
+            fs::remove_dir_all(home).unwrap();
         }
     }
 }

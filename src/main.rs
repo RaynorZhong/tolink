@@ -1,6 +1,7 @@
 mod addressing;
 mod diagnostics;
 mod journal;
+mod platform;
 mod process;
 mod runtime;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -11,9 +12,8 @@ use std::{
     env,
     error::Error,
     fs,
-    io::{Read, Write},
+    io::Write,
     net::{Ipv4Addr, Ipv6Addr},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -108,12 +108,7 @@ fn key_from_bytes(raw: &[u8]) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&seed))
 }
 fn key(path: &Path) -> Result<SigningKey> {
-    let meta = fs::symlink_metadata(path)?;
-    require(
-        meta.is_file() && !meta.file_type().is_symlink() && meta.permissions().mode() & 0o077 == 0,
-        "key must be a private regular file",
-    )?;
-    key_from_bytes(&fs::read(path)?)
+    key_from_bytes(&platform::read_key(path)?)
 }
 fn vectors(path: &Path) -> Result<()> {
     let data: Value = serde_json::from_slice(&fs::read(path)?)?;
@@ -181,6 +176,27 @@ struct WireResponse {
     value: Option<Value>,
     tls_fatal: bool,
 }
+#[cfg(windows)]
+fn require_windows_curl_header_support(path: &Path) -> Result<()> {
+    let mut command = Command::new(path);
+    command.args(["--disable", "--version"]);
+    let out = runtime::capture(command, b"", 5, true)?;
+    let version = std::str::from_utf8(&out.stdout).ok().and_then(|banner| {
+        let mut words = banner.lines().next()?.split_ascii_whitespace();
+        if words.next()? != "curl" {
+            return None;
+        }
+        let mut numbers = words.next()?.split('.');
+        let major = numbers.next()?.parse::<u32>().ok()?;
+        let minor = numbers.next()?.parse::<u32>().ok()?;
+        let patch = numbers.next()?.parse::<u32>().ok()?;
+        (numbers.next().is_none()).then_some((major, minor, patch))
+    });
+    require(
+        out.status.success() && version.is_some_and(|v| v >= (8, 10, 0)),
+        "Windows requires curl 8.10.0 or later to preserve Retry-After; no request sent",
+    )
+}
 fn wire(
     base: &str,
     ca: &Path,
@@ -207,6 +223,14 @@ fn wire(
         body.is_none_or(|raw| raw.len() <= 32768),
         "request body exceeds 32 KiB",
     )?;
+    // A Windows curl before 8.10 treats `%` as a file name. Check the
+    // configured executable before each request, including after replacement.
+    #[cfg(windows)]
+    require_windows_curl_header_support(curl_path)?;
+    #[cfg(windows)]
+    let headers_destination = "%";
+    #[cfg(not(windows))]
+    let headers_destination = "/dev/stderr";
     let mut command = Command::new(curl_path);
     command
         .args([
@@ -230,7 +254,7 @@ fn wire(
             "--max-filesize",
             "4194304",
             "--dump-header",
-            "/dev/stderr",
+            headers_destination,
             "--write-out",
             "\n%{http_code}",
             "--request",
@@ -404,7 +428,7 @@ fn main() -> Result<()> {
         }
         ["model-check", home] => runtime::model_check(Path::new(home)),
 
-        ["probe", base, ca] => probe(base, ca, "/usr/bin/curl"),
+        ["probe", base, ca] => probe(base, ca, platform::default_curl()),
         ["probe", base, ca, curl] => probe(base, ca, curl),
 
         _ => {
