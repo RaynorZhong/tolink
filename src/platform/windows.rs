@@ -123,7 +123,14 @@ pub(crate) fn pin_private_dir(path: &Path) -> io::Result<PrivateDir> {
 fn native_acl_refuses_unprotected_private_boundary() {
     let root = super::tests::Fixture::new();
     let path = root.0.join("inheritance-enabled-boundary");
-    std::fs::create_dir(&path).unwrap();
+    let descriptor = inherited_fixture_sd().unwrap();
+    let native_path = wide(&path).unwrap();
+    assert_ne!(
+        unsafe { CreateDirectoryW(native_path.as_ptr(), &attributes(&descriptor)) },
+        0,
+        "{}",
+        io::Error::last_os_error()
+    );
     let candidate = pin_dirs(&path).unwrap();
     assert_eq!(
         privacy(candidate._pins.last().unwrap()).unwrap(),
@@ -220,7 +227,7 @@ fn current_sid() -> io::Result<Vec<usize>> {
 fn sid(data: &[usize]) -> PSID {
     unsafe { (*(data.as_ptr().cast::<TOKEN_USER>())).User.Sid }
 }
-fn private_sd() -> io::Result<LocalMemory> {
+fn current_sid_string() -> io::Result<String> {
     let current = current_sid()?;
     let mut text = null_mut();
     if unsafe { ConvertSidToStringSidW(sid(&current), &mut text) } == 0 {
@@ -233,11 +240,11 @@ fn private_sd() -> io::Result<LocalMemory> {
             length += 1;
         }
     }
-    let current = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
-        .map_err(io::Error::other)?;
+    let current = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) });
     drop(text_memory);
-    // No SYSTEM or Administrators grants, inherited or explicit.
-    let sddl = format!("O:{current}D:P(A;OICI;FA;;;{current})");
+    current.map_err(io::Error::other)
+}
+fn descriptor_from_sddl(sddl: &str) -> io::Result<LocalMemory> {
     let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
     let mut descriptor = null_mut();
     if unsafe {
@@ -252,6 +259,25 @@ fn private_sd() -> io::Result<LocalMemory> {
         return Err(io::Error::last_os_error());
     }
     Ok(LocalMemory(descriptor))
+}
+fn private_sd() -> io::Result<LocalMemory> {
+    let current = current_sid_string()?;
+    // No SYSTEM or Administrators grants, inherited or explicit.
+    descriptor_from_sddl(&format!("O:{current}D:P(A;OICI;FA;;;{current})"))
+}
+#[cfg(test)]
+fn inherited_fixture_sd() -> io::Result<LocalMemory> {
+    // TokenOwner can differ from TokenUser on CI. Supply only the owner so
+    // Windows still inherits the DACL from the fixture's private parent.
+    descriptor_from_sddl(&format!("O:{}", current_sid_string()?))
+}
+#[cfg(test)]
+pub(crate) fn write_inherited_fixture_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let path = checked_path(path)?;
+    let _parent = pin_private_dir(path.parent().ok_or_else(invalid_path)?)?;
+    let descriptor = inherited_fixture_sd()?;
+    open(&path, GENERIC_WRITE, 0, CREATE_NEW, Some(&descriptor))?.write_all(bytes)
 }
 fn attributes(sd: &LocalMemory) -> SECURITY_ATTRIBUTES {
     SECURITY_ATTRIBUTES {

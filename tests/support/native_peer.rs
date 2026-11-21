@@ -318,10 +318,15 @@ fn synthetic_model(args: &[String]) -> Result<()> {
         &home.join("native-model-observed.json"),
         &json!({"observed":"before_synthetic_model","generation_id":disk["rust_generation"]["generation_id"],"synthetic":true,"real_provider_called":false,"batch_size":3}),
     )?;
-    publish(
-        usage,
-        &json!({"synthetic":true,"stdin_utf8":true,"real_provider_called":false}),
-    )?;
+    let report = json!({"synthetic":true,"stdin_utf8":true,"real_provider_called":false});
+    #[cfg(windows)]
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(usage)?
+        .write_all(&serde_json::to_vec(&report)?)?;
+    #[cfg(not(windows))]
+    publish(usage, &report)?;
     println!("answer");
     Ok(())
 }

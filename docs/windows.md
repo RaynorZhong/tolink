@@ -141,7 +141,11 @@ hermes.exe --safe-mode --ignore-rules --toolsets "" --provider PROVIDER --model 
 ```
 
 The working directory is the canonical selected state directory; the usage path
-is absolute and stays inside it. Input has a 100,000-byte local bound. The
+is absolute and stays inside it. Tolink prepares a fresh current-user-owned
+usage file before launching Hermes so a Windows token's default owner does not
+decide the report's ownership. An existing report is replaced, not truncated
+through a possible hard link. This report is separate from the durable model
+budget ledger. Input has a 100,000-byte local bound. The
 regressions exercise Unicode input longer than the Windows command-line limit
 and verify that the native peer receives it intact on stdin. Synthetic peers are
 selected by explicit fixture paths/files, not secret inherited environment

@@ -697,13 +697,15 @@ mod tests {
             path
         }
         fn populated() -> Self {
+            use std::io::Write;
             let f = Self::new();
             let mut config = example();
-            config["key_file"] = json!(f.write(
-                "seed",
-                b"private synthetic sentinel; not a real seed",
-                0o600
-            ));
+            let seed = f.0.join("seed");
+            crate::platform::open_private_new(&seed)
+                .unwrap()
+                .write_all(b"private synthetic sentinel; not a real seed")
+                .unwrap();
+            config["key_file"] = json!(seed);
             config["ca_file"] = json!(f.write("ca.pem", b"synthetic public CA bytes", 0o600));
             config["ca_sha256"] = json!(crate::sha(b"synthetic public CA bytes"));
             let executable = f.write(
@@ -938,6 +940,8 @@ mod tests {
         );
         assert_eq!(report["config"]["valid"], true);
         assert_eq!(report["files"]["key"]["contents_read"], false);
+        #[cfg(windows)]
+        assert_eq!(report["files"]["key"]["owner_matches_current_user"], true);
         assert_eq!(report["files"]["ca"]["pin_matches"], true);
         assert_eq!(report["files"]["curl_executable"]["launch_candidate"], true);
         assert_eq!(
@@ -1043,6 +1047,8 @@ mod tests {
         f.json("process.json", &json!({"state":"SECRET-PROCESS","pid":-1}));
         let report = doctor(&f.0).unwrap();
         assert_eq!(report["files"]["key"]["private_permissions"], false);
+        #[cfg(windows)]
+        assert_eq!(report["files"]["key"]["owner_matches_current_user"], true);
         assert_eq!(report["files"]["hermes_executable"]["status"], "missing");
         assert_eq!(report["self_snapshot"]["state"], "unknown");
         assert_eq!(report["self_snapshot"]["identity_matches_config"], false);
@@ -1130,7 +1136,8 @@ mod tests {
             serde_json::from_slice(&fs::read(f.0.join("config.json")).unwrap()).unwrap();
         config["owner_authorization"]["allow_public_replies"] = json!(true);
         f.json("config.json", &config);
-        assert_eq!(doctor(&f.0).unwrap()["attention_required"], false);
+        let baseline = doctor(&f.0).unwrap();
+        assert_eq!(baseline["attention_required"], false, "{baseline}");
         let original: Value =
             serde_json::from_slice(&fs::read(f.0.join("state.json")).unwrap()).unwrap();
         for issue in ["zero_version", "bad_outreach_index"] {

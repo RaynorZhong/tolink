@@ -219,6 +219,28 @@ fn publication_model_uses_utf8_stdin_beyond_windows_command_line_limit() {
 
 #[cfg(windows)]
 #[test]
+fn publication_model_usage_does_not_truncate_an_existing_link() {
+    let c = fixture_client();
+    let home = fs::canonicalize(&c.home).unwrap();
+    let peer = publication_peer(&home, "synthetic-model-peer");
+    let original = home.join("fixture-protected.json");
+    save(&original, &json!({"untouched":true})).unwrap();
+    let usage = home.join("rust-model-usage.json");
+    fs::hard_link(&original, &usage).unwrap();
+    let prompt = "synthetic file safety check";
+    fs::write(home.join("synthetic-model-expected.txt"), prompt).unwrap();
+    let config = json!({"hermes_executable":peer,"model_provider":"fixture-provider","model_name":"fixture-model","model_reasoning":"fixture-reasoning"});
+    let payload = json!({"max_text_scalars":200,"trigger":{"text":prompt}});
+    assert_eq!(model(&home, &config, &payload).unwrap(), "[SILENT]");
+    let actual = load(&original).unwrap();
+    let recorded = load(&usage).unwrap();
+    cleanup_regression_fixture(c);
+    assert_eq!(actual, json!({"untouched":true}));
+    assert_eq!(recorded["synthetic"], true);
+}
+
+#[cfg(windows)]
+#[test]
 fn publication_curl_checks_header_routing_before_any_request() {
     let c = fixture_client();
     let base = "https://192.0.2.10/participant/v1/";

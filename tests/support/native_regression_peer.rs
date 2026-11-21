@@ -98,7 +98,18 @@ fn main() -> Result<()> {
     io::stdin().lock().take(100_001).read_to_end(&mut raw)?;
     let home = fs::canonicalize(env::current_dir()?)?;
     let (usage, _) = model_input(&args, &raw, &home)?;
-    fs::write(usage, b"{\"synthetic\":true,\"stdin_utf8\":true}\n")?;
+    let report = b"{\"synthetic\":true,\"stdin_utf8\":true}\n";
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(usage)?
+            .write_all(report)?;
+    }
+    #[cfg(not(windows))]
+    fs::write(usage, report)?;
     println!("[SILENT]");
     Ok(())
 }

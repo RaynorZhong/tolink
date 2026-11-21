@@ -203,8 +203,17 @@ fn model(home: &Path, config: &Value, payload: &Value) -> Result<String> {
         "public model input exceeds local bound",
     )?;
     let command = model_command(&home, config, &prompt)?;
-    // Finish the bounded in-flight model on graceful stop, then persist its result before exit.
     require(!STOP.load(Ordering::Relaxed), "owner_stop_before_model")?;
+    // Hermes truncates the report in place. On Windows, ordinary creation can
+    // assign the token's default owner instead of its user. Give it a fresh
+    // private file without opening an existing (possibly hard-linked) report
+    // for writing. This is optional telemetry, not the model budget ledger.
+    #[cfg(windows)]
+    {
+        crate::platform::atomic_write(&home.join("rust-model-usage.json"), b"{}\n")?;
+        require(!STOP.load(Ordering::Relaxed), "owner_stop_before_model")?;
+    }
+    // Finish the bounded in-flight model on graceful stop, then persist its result before exit.
     let result = capture(command, prompt.as_bytes(), 180, false)?;
     require(
         result.status.success(),
@@ -388,31 +397,52 @@ mod tests {
 
     #[cfg(windows)]
     fn grant_foreign_read_write(path: &Path) {
+        let baseline = crate::platform::key_metadata(path).unwrap();
+        assert_eq!(
+            (baseline.private, baseline.owner),
+            (true, true),
+            "expected a private fixture"
+        );
+        drop(baseline);
         let result = Command::new("icacls.exe")
             .arg(path)
             .args(["/grant", "*S-1-1-0:(R,W)"])
             .output()
             .unwrap();
         assert!(result.status.success(), "{result:?}");
-        assert!(!crate::platform::key_metadata(path).unwrap().private);
+        let granted = crate::platform::key_metadata(path).unwrap();
+        assert_eq!(
+            (granted.private, granted.owner),
+            (false, true),
+            "expected only a DACL change"
+        );
     }
 
     #[cfg(windows)]
     fn runtime_refuses_foreign_acl(filename: &str) {
+        use crate::platform::write_inherited_fixture_file;
         let mut fixture = fixture_client();
         let home = fixture.home.clone();
         let seed = home.join("fixture.seed");
         let ca = home.join("fixture-ca.pem");
-        // Ordinary creation models migrated files inheriting from the private root.
-        fs::write(&seed, URL_SAFE_NO_PAD.encode([7; 32])).unwrap();
+        // Model files with an inherited DACL without relying on the token's default owner.
+        write_inherited_fixture_file(&seed, URL_SAFE_NO_PAD.encode([7; 32]).as_bytes()).unwrap();
         fs::write(&ca, b"synthetic CA pin input").unwrap();
         fixture.config["key_file"] = json!(seed);
         fixture.config["ca_file"] = json!(ca);
         fixture.config["ca_sha256"] = json!(sha(b"synthetic CA pin input"));
         fixture.config["base_url"] = json!("https://localhost/participant/v1/");
         fixture.config["authority"] = json!("localhost");
-        fs::write(home.join("config.json"), fixture.config.to_string()).unwrap();
-        fs::write(home.join("state.json"), fixture.state.to_string()).unwrap();
+        write_inherited_fixture_file(
+            &home.join("config.json"),
+            fixture.config.to_string().as_bytes(),
+        )
+        .unwrap();
+        write_inherited_fixture_file(
+            &home.join("state.json"),
+            fixture.state.to_string().as_bytes(),
+        )
+        .unwrap();
         drop(fixture);
         drop(Client::open(&home).expect("private inherited config, key and state must work"));
 
